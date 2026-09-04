@@ -8,8 +8,10 @@ Ping multiple hosts simultaneously with a live-updating terminal table.
 
 - **Comma-separated hosts** — `pingm 8.8.8.8,1.1.1.1`
 - **IP ranges** — `pingm 10.0.0.1-10.0.0.10`
+- **Relative ranges** — `pingm 10.0.0.0+10` (10.0.0.0 through 10.0.0.9)
+- **CIDR subnets** — `pingm 10.0.0.0/24` (also /30, /31, /32, etc.)
 - **Hostnames** — `pingm google.com,cloudflare.com`
-- **Mixed** — `pingm google.com,8.8.8.1-8.8.8.4`
+- **Mixed** — `pingm google.com,8.8.8.1-8.8.8.4,10.0.0.0/30`
 - **Live table** — color-coded status, latency, packet loss, min/avg/max
 - **Zero dependencies** — pure bash, uses the system `ping` command
 
@@ -42,6 +44,13 @@ pingm 192.168.0.1,192.168.0.40
 
 # Ping an IP range (expands to 10 hosts)
 pingm 10.0.0.1-10.0.0.10
+
+# Ping a relative range: 10.0.0.0 through 10.0.0.9 (10 hosts)
+pingm 10.0.0.0+10
+
+# Ping a whole subnet by CIDR prefix (network through broadcast)
+pingm 10.0.0.0/24
+pingm 10.0.0.0/30
 
 # Ping hostnames
 pingm google.com,cloudflare.com
@@ -86,7 +95,7 @@ Trend vs. last refresh: ▼ improving   ▲ worsening
 
 ## Limits
 
-- Maximum **256 hosts** per invocation (configurable in source via `MAX_HOSTS`)
+- Maximum **256 hosts** per invocation (configurable in source via `MAX_HOSTS`) — this includes hosts expanded from a range, `+N`, or CIDR subnet, so `/23` and larger will be rejected
 - Requires `bash`, `ping`, `awk`, `grep`, `mktemp` (standard on macOS/Linux)
 
 ## License

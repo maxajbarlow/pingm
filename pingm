@@ -5,10 +5,12 @@
 # Usage:
 #   pingm 192.168.0.1,192.168.0.40
 #   pingm 10.0.0.1-10.0.0.10
+#   pingm 10.0.0.0+10
+#   pingm 10.0.0.0/24
 #   pingm google.com,cloudflare.com,8.8.8.1-8.8.8.4
 #
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 MAX_HOSTS=256
 INTERVAL=1
 COUNT=0
@@ -28,11 +30,13 @@ pingm v${VERSION} — Ping multiple hosts with a live-updating table
 Usage: pingm [OPTIONS] <hosts>
 
 Arguments:
-  <hosts>   Comma-separated IPs/hostnames, or IP ranges
+  <hosts>   Comma-separated IPs/hostnames, IP ranges, +N ranges, or CIDR subnets
 
 Examples:
   pingm 192.168.0.1,192.168.0.40
   pingm 10.0.0.1-10.0.0.10
+  pingm 10.0.0.0+10
+  pingm 10.0.0.0/24
   pingm google.com,cloudflare.com
   pingm google.com,8.8.8.1-8.8.8.4
 
@@ -62,6 +66,11 @@ is_ip() {
     [[ "$1" =~ $pat ]]
 }
 
+is_uint() {
+    local pat='^[0-9]+$'
+    [[ "$1" =~ $pat ]]
+}
+
 expand_range() {
     local start="$1" end="$2"
     local s e
@@ -81,6 +90,28 @@ expand_range() {
     done
 }
 
+# Expand "10.0.0.0+10" into 10 consecutive addresses starting at 10.0.0.0
+expand_plus() {
+    local ip="$1" n="$2"
+    local s
+    s=$(ip_to_int "$ip")
+    expand_range "$ip" "$(int_to_ip "$(( s + n - 1 ))")"
+}
+
+# Expand "10.0.0.0/24" into every address in that subnet (network through
+# broadcast). /32 collapses to the single host; /31 yields its two
+# point-to-point addresses — no special-casing needed, the mask math
+# handles both.
+expand_cidr() {
+    local ip="$1" prefix="$2"
+    local ip_int mask net_int bcast_int
+    ip_int=$(ip_to_int "$ip")
+    mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    net_int=$(( ip_int & mask ))
+    bcast_int=$(( net_int | (~mask & 0xFFFFFFFF) ))
+    expand_range "$(int_to_ip "$net_int")" "$(int_to_ip "$bcast_int")"
+}
+
 # ── Parse Hosts ────────────────────────────────────────────────────
 parse_hosts() {
     local input="$1"
@@ -94,7 +125,31 @@ parse_hosts() {
         token="${token%"${token##*[![:space:]]}"}"
         [[ -z "$token" ]] && continue
 
-        if [[ "$token" == *-* ]]; then
+        if [[ "$token" == */* ]]; then
+            left="${token%%/*}"
+            right="${token##*/}"
+            if ! is_ip "$left" || ! is_uint "$right" || (( right > 32 )); then
+                echo "Error: Invalid CIDR notation '$token' (expected e.g. 10.0.0.0/24)" >&2
+                exit 1
+            fi
+            local ip
+            while IFS= read -r ip; do
+                echo "$ip"
+                count=$((count + 1))
+            done < <(expand_cidr "$left" "$right")
+        elif [[ "$token" == *+* ]]; then
+            left="${token%%+*}"
+            right="${token##*+}"
+            if ! is_ip "$left" || ! is_uint "$right" || (( right < 1 )); then
+                echo "Error: Invalid range notation '$token' (expected e.g. 10.0.0.0+10)" >&2
+                exit 1
+            fi
+            local ip
+            while IFS= read -r ip; do
+                echo "$ip"
+                count=$((count + 1))
+            done < <(expand_plus "$left" "$right")
+        elif [[ "$token" == *-* ]]; then
             left="${token%%-*}"
             right="${token##*-}"
             if is_ip "$left" && is_ip "$right"; then
