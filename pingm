@@ -1,0 +1,420 @@
+#!/usr/bin/env bash
+#
+# pingm — Ping multiple hosts with a live-updating table display
+#
+# Usage:
+#   pingm 192.168.0.1,192.168.0.40
+#   pingm 10.0.0.1-10.0.0.10
+#   pingm google.com,cloudflare.com,8.8.8.1-8.8.8.4
+#
+
+VERSION="1.0.0"
+MAX_HOSTS=256
+INTERVAL=1
+COUNT=0
+
+# ── ANSI ───────────────────────────────────────────────────────────
+RED=$'\033[31m'
+GREEN=$'\033[32m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+RESET=$'\033[0m'
+
+# ── Usage ──────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+pingm v${VERSION} — Ping multiple hosts with a live-updating table
+
+Usage: pingm [OPTIONS] <hosts>
+
+Arguments:
+  <hosts>   Comma-separated IPs/hostnames, or IP ranges
+
+Examples:
+  pingm 192.168.0.1,192.168.0.40
+  pingm 10.0.0.1-10.0.0.10
+  pingm google.com,cloudflare.com
+  pingm google.com,8.8.8.1-8.8.8.4
+
+Options:
+  -i SECS   Interval between pings per host (default: 1)
+  -c COUNT  Stop after COUNT pings per host (default: unlimited)
+  -h        Show this help message
+  -v        Show version
+EOF
+    exit 0
+}
+
+# ── IP Utilities ───────────────────────────────────────────────────
+ip_to_int() {
+    local a b c d
+    IFS='.' read -r a b c d <<< "$1"
+    echo $(( (a << 24) + (b << 16) + (c << 8) + d ))
+}
+
+int_to_ip() {
+    local n=$1
+    echo "$(( (n >> 24) & 255 )).$(( (n >> 16) & 255 )).$(( (n >> 8) & 255 )).$(( n & 255 ))"
+}
+
+is_ip() {
+    local pat='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    [[ "$1" =~ $pat ]]
+}
+
+expand_range() {
+    local start="$1" end="$2"
+    local s e
+    s=$(ip_to_int "$start")
+    e=$(ip_to_int "$end")
+    if (( s > e )); then
+        echo "Error: Range start ($start) is after end ($end)" >&2
+        exit 1
+    fi
+    if (( e - s + 1 > MAX_HOSTS )); then
+        echo "Error: Range has $((e - s + 1)) hosts (max ${MAX_HOSTS})" >&2
+        exit 1
+    fi
+    local i
+    for (( i = s; i <= e; i++ )); do
+        int_to_ip "$i"
+    done
+}
+
+# ── Parse Hosts ────────────────────────────────────────────────────
+parse_hosts() {
+    local input="$1"
+    local tokens token left right count=0
+
+    IFS=',' read -ra tokens <<< "$input"
+
+    for token in "${tokens[@]}"; do
+        # Trim whitespace
+        token="${token#"${token%%[![:space:]]*}"}"
+        token="${token%"${token##*[![:space:]]}"}"
+        [[ -z "$token" ]] && continue
+
+        if [[ "$token" == *-* ]]; then
+            left="${token%%-*}"
+            right="${token##*-}"
+            if is_ip "$left" && is_ip "$right"; then
+                local ip
+                while IFS= read -r ip; do
+                    echo "$ip"
+                    count=$((count + 1))
+                done < <(expand_range "$left" "$right")
+            else
+                # Hostname containing hyphens (e.g. my-server.example.com)
+                echo "$token"
+                count=$((count + 1))
+            fi
+        else
+            echo "$token"
+            count=$((count + 1))
+        fi
+    done
+
+    if (( count == 0 )); then
+        echo "Error: No hosts specified." >&2
+        exit 1
+    fi
+    if (( count > MAX_HOSTS )); then
+        echo "Error: Too many hosts (${count}). Maximum is ${MAX_HOSTS}." >&2
+        exit 1
+    fi
+}
+
+# ── Detect OS-specific ping timeout flag ───────────────────────────
+get_timeout_flag() {
+    case "$(uname -s)" in
+        Darwin) echo "-W 1000" ;;  # macOS: milliseconds
+        *)      echo "-W 1"    ;;  # Linux: seconds
+    esac
+}
+
+# ── Ping Worker (runs as a background process per host) ────────────
+ping_worker() {
+    local host="$1" datafile="$2" tflag="$3"
+    local sent=0 recv=0 last="-"
+    local mn="-" mx="-" sm="0"
+
+    # Initialize datafile
+    echo "0 0 - - - 0" > "$datafile"
+
+    while true; do
+        sent=$((sent + 1))
+
+        # Run a single ping (timeout flag varies by OS)
+        # shellcheck disable=SC2086
+        local out
+        out=$(ping -c 1 $tflag "$host" 2>/dev/null) || true
+
+        # Extract round-trip time
+        local rtt
+        rtt=$(echo "$out" | grep -oE 'time=[0-9.]+' | head -1 | cut -d= -f2)
+
+        if [[ -n "$rtt" ]]; then
+            recv=$((recv + 1))
+            last="$rtt"
+
+            # Update min, max, and cumulative sum via awk (for float math)
+            read -r mn mx sm <<< "$(awk \
+                -v r="$rtt" -v mn="$mn" -v mx="$mx" -v sm="$sm" \
+                'BEGIN {
+                    v = r + 0
+                    if (mn == "-" || v < mn + 0) mn = r
+                    if (mx == "-" || v > mx + 0) mx = r
+                    sm = sm + v
+                    printf "%s %s %.3f", mn, mx, sm
+                }')"
+        fi
+
+        # Atomic write: write to .tmp then rename to avoid partial reads
+        echo "$sent $recv $last $mn $mx $sm" > "${datafile}.tmp"
+        mv "${datafile}.tmp" "$datafile"
+
+        # Stop if we've reached the requested count
+        if (( COUNT > 0 && sent >= COUNT )); then
+            break
+        fi
+
+        sleep "$INTERVAL"
+    done
+}
+
+# ── Trend Helpers ──────────────────────────────────────────────────
+# Compare a metric to its previous reading (lower is always better here:
+# less packet loss, less latency). Sets TREND_COLOR / TREND_ARROW.
+calc_trend() {
+    local curr="$1" prev="$2"
+    TREND_COLOR=""
+    TREND_ARROW=""
+    [[ -z "$prev" ]] && return
+
+    local cmp
+    cmp=$(awk -v c="$curr" -v p="$prev" 'BEGIN {
+        if (c + 0 < p + 0)      print "down"
+        else if (c + 0 > p + 0) print "up"
+        else                    print "same"
+    }')
+
+    case "$cmp" in
+        down) TREND_COLOR="$GREEN"; TREND_ARROW="▼" ;;  # improving
+        up)   TREND_COLOR="$RED";   TREND_ARROW="▲" ;;  # worsening
+    esac
+}
+
+# Print a value (optionally with a colored trend arrow) padded to a fixed
+# visible width, without letting ANSI codes throw off printf's own padding.
+print_metric() {
+    local text="$1" width="$2" color="$3" arrow="$4"
+    local full="$text"
+    [[ -n "$arrow" ]] && full="${text} ${arrow}"
+
+    local pad=$(( width - ${#full} ))
+    (( pad < 0 )) && pad=0
+
+    if [[ -n "$color" ]]; then
+        printf '%b' "${color}${full}${RESET}"
+    else
+        printf '%s' "$full"
+    fi
+    printf '%*s' "$pad" ""
+}
+
+# ── Draw Table ─────────────────────────────────────────────────────
+draw_table() {
+    # Move cursor to top-left corner and clear screen
+    printf '\033[H\033[J'
+
+    # Calculate column width for HOST based on longest hostname
+    local hw=4 h
+    for h in "${HOSTS[@]}"; do
+        (( ${#h} > hw )) && hw=${#h}
+    done
+    hw=$((hw + 2))
+
+    # Title bar
+    printf '%b' "${BOLD}pingm${RESET} — Live Multi-Ping   ${DIM}[Ctrl+C to stop]${RESET}\n\n"
+
+    # Column headers
+    printf '%b' "${BOLD}"
+    printf "%-${hw}s  %-8s  %-12s  %-10s  %-10s  %-12s  %-10s" \
+        "HOST" "STATUS" "LATENCY" "LOSS" "MIN" "AVG" "MAX"
+    printf '%b\n' "${RESET}"
+
+    # Separator line
+    local tw=$((hw + 8 + 12 + 10 + 10 + 12 + 10 + 12))
+    printf '%b' "$DIM"
+    local i
+    for (( i = 0; i < tw; i++ )); do printf '─'; done
+    printf '%b\n' "$RESET"
+
+    # Data rows — one per host
+    for idx in "${!HOSTS[@]}"; do
+        local h="${HOSTS[$idx]}"
+        local df="$WORK_DIR/${h//[\/:]/_}"
+
+        # Host hasn't reported yet
+        if [[ ! -f "$df" ]]; then
+            printf "%-${hw}s  " "$h"
+            printf '%b' "${DIM}WAIT    ${RESET}"
+            printf "  %-12s  %-10s  %-10s  %-12s  %-10s\n" "—" "—" "—" "—" "—"
+            continue
+        fi
+
+        # Read latest stats from worker's data file
+        local sent recv last mn mx sm
+        read -r sent recv last mn mx sm < "$df" 2>/dev/null || continue
+
+        # Calculate packet loss %
+        local loss="—"
+        if (( sent > 0 )); then
+            loss=$(awk -v s="$sent" -v r="$recv" 'BEGIN { printf "%.1f%%", ((s-r)/s)*100 }')
+        fi
+
+        # Calculate running average RTT
+        local avg="—"
+        if (( recv > 0 )); then
+            avg=$(awk -v s="$sm" -v r="$recv" 'BEGIN { printf "%.1f ms", s/r }')
+        fi
+
+        # Trend vs. the previous refresh (lower is always better)
+        local loss_num="${loss%\%}"
+        calc_trend "$loss_num" "${PREV_LOSS[$idx]}"
+        local loss_color="$TREND_COLOR" loss_arrow="$TREND_ARROW"
+
+        # Print host column
+        printf "%-${hw}s  " "$h"
+
+        # Print status + remaining columns
+        # Status is printed separately to handle ANSI color codes without
+        # breaking printf column alignment
+        if [[ "$last" == "-" ]] || (( recv == 0 )); then
+            printf '%b' "${RED}✘ DOWN  ${RESET}"
+            printf "  %-12s  " "—"
+            print_metric "$loss" 10 "$loss_color" "$loss_arrow"
+            printf "  %-10s  %-12s  %-10s\n" "—" "—" "—"
+        else
+            local avg_num="${avg% ms}"
+            calc_trend "$avg_num" "${PREV_AVG[$idx]}"
+            local avg_color="$TREND_COLOR" avg_arrow="$TREND_ARROW"
+
+            printf '%b' "${GREEN}✔ UP    ${RESET}"
+            printf "  %-12s  " "${last} ms"
+            print_metric "$loss" 10 "$loss_color" "$loss_arrow"
+            printf "  %-10s  " "${mn} ms"
+            print_metric "$avg" 12 "$avg_color" "$avg_arrow"
+            printf "  %-10s\n" "${mx} ms"
+
+            PREV_AVG[$idx]="$avg_num"
+        fi
+
+        PREV_LOSS[$idx]="$loss_num"
+    done
+
+    # Footer
+    printf '\n%b' "${DIM}Interval: ${INTERVAL}s"
+    (( COUNT > 0 )) && printf " | Count: %d" "$COUNT"
+    printf '%b\n' "${RESET}"
+    printf '%b\n' "${DIM}Trend vs. last refresh:${RESET} ${GREEN}▼ improving${RESET}   ${RED}▲ worsening${RESET}"
+}
+
+# ── Cleanup ────────────────────────────────────────────────────────
+cleanup() {
+    if (( ${#PIDS[@]} > 0 )); then
+        for pid in "${PIDS[@]}"; do
+            kill "$pid" 2>/dev/null || true
+        done
+        wait 2>/dev/null || true
+    fi
+    rm -rf "$WORK_DIR"
+    tput cnorm 2>/dev/null || true
+    printf '\n'
+    exit 0
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════
+
+# Parse command-line options
+while getopts "i:c:hv" opt; do
+    case $opt in
+        i) INTERVAL="$OPTARG" ;;
+        c) COUNT="$OPTARG"    ;;
+        h) usage ;;
+        v) echo "pingm v${VERSION}"; exit 0 ;;
+        *) usage ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# Require at least one host argument
+if [[ $# -lt 1 ]]; then
+    echo "Error: No hosts specified. Run 'pingm -h' for help." >&2
+    exit 1
+fi
+
+# Build host list from the argument
+HOSTS=()
+while IFS= read -r line; do
+    HOSTS+=("$line")
+done < <(parse_hosts "$1")
+
+if (( ${#HOSTS[@]} == 0 )); then
+    echo "Error: No valid hosts." >&2
+    exit 1
+fi
+
+# Previous LOSS/AVG readings per host (by index), used to draw trend arrows
+PREV_LOSS=()
+PREV_AVG=()
+
+# Create temp working directory for per-host data files
+WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pingm.XXXXXX")
+TFLAG=$(get_timeout_flag)
+PIDS=()
+
+# Trap signals for clean shutdown
+trap cleanup INT TERM EXIT
+
+# Hide cursor for clean table display
+tput civis 2>/dev/null || true
+
+# Launch one background ping worker per host
+for h in "${HOSTS[@]}"; do
+    ping_worker "$h" "$WORK_DIR/${h//[\/:]/_}" "$TFLAG" &
+    PIDS+=($!)
+done
+
+# Main display loop
+if (( COUNT > 0 )); then
+    # Finite mode: refresh until all workers finish
+    while true; do
+        draw_table
+
+        # Check if all workers have exited
+        all_done=true
+        for pid in "${PIDS[@]}"; do
+            kill -0 "$pid" 2>/dev/null && all_done=false && break
+        done
+
+        if $all_done; then
+            # Final redraw with complete data
+            draw_table
+            tput cnorm 2>/dev/null || true
+            printf '\n%bDone. Press Ctrl+C to exit.%b\n' "$DIM" "$RESET"
+            # Wait for user to dismiss
+            while true; do sleep 60; done
+        fi
+
+        sleep 1
+    done
+else
+    # Continuous mode: refresh until Ctrl+C
+    while true; do
+        draw_table
+        sleep 1
+    done
+fi
