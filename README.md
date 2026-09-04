@@ -71,8 +71,22 @@ pingm -c 5 8.8.8.8,1.1.1.1
 |------|---------|-------------|
 | `-i SECS` | `1` | Interval between pings per host |
 | `-c COUNT` | unlimited | Stop after COUNT pings per host |
+| `-y` | — | Skip the confirmation prompt for large host counts |
 | `-h` | — | Show help |
 | `-v` | — | Show version |
+
+### Large host counts
+
+Pinging **50+ hosts** at once (e.g. a `/24` or larger `+N` range) asks for
+confirmation first — simultaneously pinging that many devices can look like
+a subnet flood to network monitoring and forks a background worker per host.
+Pass `-y` to skip the prompt, which is required when running non-interactively
+(cron, CI, piped input) since there's no TTY to confirm on.
+
+```bash
+pingm 10.0.0.0/24        # prompts: "About to ping 256 hosts simultaneously. Continue? [y/N]"
+pingm -y 10.0.0.0/24      # skips the prompt
+```
 
 ### Output
 

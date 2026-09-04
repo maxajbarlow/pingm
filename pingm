@@ -10,10 +10,12 @@
 #   pingm google.com,cloudflare.com,8.8.8.1-8.8.8.4
 #
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 MAX_HOSTS=256
+CONFIRM_THRESHOLD=50
 INTERVAL=1
 COUNT=0
+ASSUME_YES=false
 
 # ── ANSI ───────────────────────────────────────────────────────────
 RED=$'\033[31m'
@@ -43,8 +45,12 @@ Examples:
 Options:
   -i SECS   Interval between pings per host (default: 1)
   -c COUNT  Stop after COUNT pings per host (default: unlimited)
+  -y        Skip the confirmation prompt for large host counts
   -h        Show this help message
   -v        Show version
+
+Pinging ${CONFIRM_THRESHOLD}+ hosts at once asks for confirmation first
+(use -y to skip it, e.g. in scripts).
 EOF
     exit 0
 }
@@ -394,10 +400,11 @@ cleanup() {
 # ═══════════════════════════════════════════════════════════════════
 
 # Parse command-line options
-while getopts "i:c:hv" opt; do
+while getopts "i:c:yhv" opt; do
     case $opt in
         i) INTERVAL="$OPTARG" ;;
         c) COUNT="$OPTARG"    ;;
+        y) ASSUME_YES=true    ;;
         h) usage ;;
         v) echo "pingm v${VERSION}"; exit 0 ;;
         *) usage ;;
@@ -420,6 +427,21 @@ done < <(parse_hosts "$1")
 if (( ${#HOSTS[@]} == 0 )); then
     echo "Error: No valid hosts." >&2
     exit 1
+fi
+
+# Large simultaneous ping counts can look like a subnet flood to network
+# monitoring and fork a lot of background workers, so confirm first.
+if (( ${#HOSTS[@]} >= CONFIRM_THRESHOLD )) && ! $ASSUME_YES; then
+    if [[ ! -t 0 ]]; then
+        echo "Error: About to ping ${#HOSTS[@]} hosts at once — re-run with -y to skip this check (no TTY to confirm)." >&2
+        exit 1
+    fi
+    printf '%bAbout to ping %d hosts simultaneously. Continue? [y/N] %b' "$BOLD" "${#HOSTS[@]}" "$RESET"
+    read -r confirm
+    case "$confirm" in
+        y|Y|yes|YES) ;;
+        *) echo "Aborted."; exit 0 ;;
+    esac
 fi
 
 # Previous LOSS/AVG readings per host (by index), used to draw trend arrows
