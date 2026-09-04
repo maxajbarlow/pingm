@@ -100,7 +100,7 @@ HOST              STATUS    LATENCY       LOSS        MIN         AVG           
 google.com        ✔ UP      18.7 ms       0.0%        16.2 ms     18.7 ms       21.3 ms
 
 Interval: 1s
-Trend vs. last refresh: ▼ improving   ▲ worsening
+Trend vs. last refresh: ▼ better   ▲ worse
 ```
 
 - **✔ UP** (green) — host is responding

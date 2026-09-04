@@ -260,8 +260,8 @@ calc_trend() {
     }')
 
     case "$cmp" in
-        down) TREND_COLOR="$GREEN"; TREND_ARROW="▼" ;;  # improving
-        up)   TREND_COLOR="$RED";   TREND_ARROW="▲" ;;  # worsening
+        down) TREND_COLOR="$GREEN"; TREND_ARROW="▼" ;;  # better
+        up)   TREND_COLOR="$RED";   TREND_ARROW="▲" ;;  # worse
     esac
 }
 
@@ -378,7 +378,7 @@ draw_table() {
     printf '\n%b' "${DIM}Interval: ${INTERVAL}s"
     (( COUNT > 0 )) && printf " | Count: %d" "$COUNT"
     printf '%b\n' "${RESET}"
-    printf '%b\n' "${DIM}Trend vs. last refresh:${RESET} ${GREEN}▼ improving${RESET}   ${RED}▲ worsening${RESET}"
+    printf '%b\n' "${DIM}Trend vs. last refresh:${RESET} ${GREEN}▼ better${RESET}   ${RED}▲ worse${RESET}"
 }
 
 # ── Cleanup ────────────────────────────────────────────────────────
