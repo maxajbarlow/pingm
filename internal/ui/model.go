@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -63,7 +64,16 @@ const (
 )
 
 type tickMsg time.Time
+type frameMsg time.Time
 type finishedMsg struct{}
+
+// How long a newly-alive row stays highlighted, and how often the screen is
+// repainted while one is. The frame ticker runs only while something is
+// actually animating, so an idle table still costs nothing to display.
+const (
+	flashDuration = 1300 * time.Millisecond
+	frameInterval = 90 * time.Millisecond
+)
 
 // Source supplies host snapshots. An interface rather than *monitor.Monitor so
 // the model can be exercised without opening a socket.
@@ -89,6 +99,15 @@ type Model struct {
 	prevLoss []float64
 	prevAvg  []float64
 	hasPrev  []bool
+
+	// aliveAt records when each host most recently came up, which drives the
+	// highlight. Indexed by host, so the marker follows the host even as a
+	// filter moves its row around.
+	aliveAt   []time.Time
+	animating bool
+
+	// now is injected so the animation can be tested without sleeping.
+	now func() time.Time
 
 	done     bool
 	quitting bool
@@ -120,6 +139,8 @@ func NewModel(mon Source, filter Filter, interval time.Duration, limit int, fini
 		prevLoss: make([]float64, len(views)),
 		prevAvg:  make([]float64, len(views)),
 		hasPrev:  make([]bool, len(views)),
+		aliveAt:  make([]time.Time, len(views)),
+		now:      time.Now,
 		width:    80,
 		height:   24,
 	}
@@ -127,6 +148,10 @@ func NewModel(mon Source, filter Filter, interval time.Duration, limit int, fini
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(m.tick(), m.waitForFinish())
+}
+
+func (m Model) frame() tea.Cmd {
+	return tea.Tick(frameInterval, func(t time.Time) tea.Msg { return frameMsg(t) })
 }
 
 func (m Model) tick() tea.Cmd {
@@ -170,7 +195,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.refreshViews()
+		// Starting a highlight turns the frame ticker on; it switches itself
+		// off again once every highlight has faded.
+		if m.anyFlashing() && !m.animating {
+			m.animating = true
+			return m, tea.Batch(m.tick(), m.frame())
+		}
 		return m, m.tick()
+
+	case frameMsg:
+		if !m.anyFlashing() {
+			m.animating = false
+			return m, nil
+		}
+		return m, m.frame()
 	}
 	return m, nil
 }
@@ -179,12 +217,47 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // to replace into the trend baseline. A host still waiting has no baseline
 // worth comparing against, so it gets no arrow on its first real reading.
 func (m *Model) refreshViews() {
+	next := m.mon.Snapshot()
+
 	for i := range m.views {
+		// A host that was not up and now is has just come alive — whether
+		// that is a recovery or its very first reply.
+		if i < len(next) && m.views[i].State != monitor.StateUp && next[i].State == monitor.StateUp {
+			m.aliveAt[i] = m.now()
+		}
 		m.prevLoss[i] = m.views[i].Loss
 		m.prevAvg[i] = float64(m.views[i].Avg)
 		m.hasPrev[i] = m.views[i].State != monitor.StateWaiting
 	}
-	m.views = m.mon.Snapshot()
+	m.views = next
+}
+
+// flash is how strongly host i is highlighted right now, counting down from
+// FlashMax at the moment it came alive to FlashNone once flashDuration has
+// elapsed.
+func (m Model) flash(i int) Flash {
+	if i >= len(m.aliveAt) || m.aliveAt[i].IsZero() {
+		return FlashNone
+	}
+	elapsed := m.now().Sub(m.aliveAt[i])
+	if elapsed < 0 || elapsed >= flashDuration {
+		return FlashNone
+	}
+	remaining := float64(flashDuration-elapsed) / float64(flashDuration)
+	level := Flash(math.Ceil(remaining * float64(FlashMax)))
+	if level > FlashMax {
+		level = FlashMax
+	}
+	return level
+}
+
+func (m Model) anyFlashing() bool {
+	for i := range m.aliveAt {
+		if m.flash(i) > FlashNone {
+			return true
+		}
+	}
+	return false
 }
 
 func (m Model) matching() []int {
@@ -226,7 +299,7 @@ func (m Model) View() string {
 			shown, hidden = shown[:budget-1], len(shown)-(budget-1)
 		}
 		for _, i := range shown {
-			b.WriteString(Row(m.views[i], cols, m.lossTrend(i), m.avgTrend(i)))
+			b.WriteString(Row(m.views[i], cols, m.lossTrend(i), m.avgTrend(i), m.flash(i)))
 			b.WriteString("\n")
 		}
 		if hidden > 0 {

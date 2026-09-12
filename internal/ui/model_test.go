@@ -278,3 +278,188 @@ func TestFilterString(t *testing.T) {
 		}
 	}
 }
+
+// --- Alive highlight ------------------------------------------------------
+
+// clock is a controllable time source so the fade can be tested without sleeps.
+type clock struct{ t time.Time }
+
+func (c *clock) now() time.Time          { return c.t }
+func (c *clock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+func newClockedModel(frames ...[]monitor.HostView) (Model, *clock) {
+	c := &clock{t: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+	m := NewModel(&fakeSource{frames: frames}, FilterAll, time.Second, 0, nil)
+	m.now = c.now
+	m.width, m.height = 100, 30
+	return m, c
+}
+
+func TestHostComingUpFromDownStartsAtFullFlash(t *testing.T) {
+	m, _ := newClockedModel(
+		[]monitor.HostView{down("10.0.0.1", 100)},
+		[]monitor.HostView{up("10.0.0.1", ms(5), ms(5), 50)},
+	)
+	if got := m.flash(0); got != FlashNone {
+		t.Fatalf("flash = %v before the host came up, want FlashNone", got)
+	}
+
+	m = advance(m)
+	if got := m.flash(0); got != FlashMax {
+		t.Errorf("flash = %v the instant the host came up, want FlashMax", got)
+	}
+}
+
+func TestFirstReplyAlsoFlashes(t *testing.T) {
+	m, _ := newClockedModel(
+		[]monitor.HostView{waiting("10.0.0.1")},
+		[]monitor.HostView{up("10.0.0.1", ms(5), ms(5), 0)},
+	)
+	m = advance(m)
+	if got := m.flash(0); got != FlashMax {
+		t.Errorf("flash = %v on a host's first reply, want FlashMax", got)
+	}
+}
+
+func TestFlashFadesToNothingOverTheDuration(t *testing.T) {
+	m, c := newClockedModel(
+		[]monitor.HostView{down("h", 100)},
+		[]monitor.HostView{up("h", ms(5), ms(5), 50)},
+	)
+	m = advance(m)
+
+	prev := m.flash(0)
+	if prev != FlashMax {
+		t.Fatalf("flash = %v at the start, want FlashMax", prev)
+	}
+	// Step through the animation; intensity must never increase.
+	for elapsed := frameInterval; elapsed < flashDuration; elapsed += frameInterval {
+		c.advance(frameInterval)
+		got := m.flash(0)
+		if got > prev {
+			t.Errorf("flash rose from %v to %v at %v into the fade", prev, got, elapsed)
+		}
+		if got < FlashNone {
+			t.Errorf("flash went negative (%v) at %v", got, elapsed)
+		}
+		prev = got
+	}
+	c.advance(frameInterval)
+	if got := m.flash(0); got != FlashNone {
+		t.Errorf("flash = %v after the full duration, want FlashNone", got)
+	}
+}
+
+func TestFlashEndsExactlyAtTheDuration(t *testing.T) {
+	m, c := newClockedModel(
+		[]monitor.HostView{down("h", 100)},
+		[]monitor.HostView{up("h", ms(5), ms(5), 50)},
+	)
+	m = advance(m)
+
+	c.advance(flashDuration - time.Millisecond)
+	if m.flash(0) == FlashNone {
+		t.Error("flash ended before the duration elapsed")
+	}
+	c.advance(time.Millisecond)
+	if got := m.flash(0); got != FlashNone {
+		t.Errorf("flash = %v at exactly the duration, want FlashNone", got)
+	}
+}
+
+// A host that stays up must not keep re-flashing on every refresh.
+func TestStayingUpDoesNotReFlash(t *testing.T) {
+	m, c := newClockedModel(
+		[]monitor.HostView{down("h", 100)},
+		[]monitor.HostView{up("h", ms(5), ms(5), 50)},
+		[]monitor.HostView{up("h", ms(6), ms(6), 40)},
+	)
+	m = advance(m) // came up: flashes
+	c.advance(flashDuration)
+	m = advance(m) // still up
+
+	if got := m.flash(0); got != FlashNone {
+		t.Errorf("flash = %v for a host that never went away, want FlashNone", got)
+	}
+}
+
+func TestGoingDownDoesNotFlash(t *testing.T) {
+	m, _ := newClockedModel(
+		[]monitor.HostView{up("h", ms(5), ms(5), 0)},
+		[]monitor.HostView{down("h", 50)},
+	)
+	m = advance(m)
+	if got := m.flash(0); got != FlashNone {
+		t.Errorf("flash = %v for a host going down, want FlashNone", got)
+	}
+}
+
+func TestRecoveringTwiceFlashesAgain(t *testing.T) {
+	m, c := newClockedModel(
+		[]monitor.HostView{down("h", 100)},
+		[]monitor.HostView{up("h", ms(5), ms(5), 50)},
+		[]monitor.HostView{down("h", 60)},
+		[]monitor.HostView{up("h", ms(5), ms(5), 40)},
+	)
+	m = advance(m)
+	c.advance(flashDuration) // first flash expires
+	m = advance(m)           // goes down
+	m = advance(m)           // comes back
+
+	if got := m.flash(0); got != FlashMax {
+		t.Errorf("flash = %v on a second recovery, want FlashMax", got)
+	}
+}
+
+func TestFlashOnlyAffectsTheHostThatChanged(t *testing.T) {
+	m, _ := newClockedModel(
+		[]monitor.HostView{up("a", ms(5), ms(5), 0), down("b", 100)},
+		[]monitor.HostView{up("a", ms(5), ms(5), 0), up("b", ms(9), ms(9), 50)},
+	)
+	m = advance(m)
+
+	if got := m.flash(0); got != FlashNone {
+		t.Errorf("host a flash = %v, want FlashNone — it never changed", got)
+	}
+	if got := m.flash(1); got != FlashMax {
+		t.Errorf("host b flash = %v, want FlashMax", got)
+	}
+}
+
+// The frame ticker must start when a highlight begins and stop when it ends,
+// so an idle table is not repainted 11 times a second for nothing.
+func TestAnimationTickerRunsOnlyWhileFlashing(t *testing.T) {
+	m, c := newClockedModel(
+		[]monitor.HostView{down("h", 100)},
+		[]monitor.HostView{up("h", ms(5), ms(5), 50)},
+	)
+	if m.anyFlashing() {
+		t.Fatal("anyFlashing() is true before anything happened")
+	}
+
+	next, cmd := m.Update(tickMsg(time.Now()))
+	m = next.(Model)
+	if !m.animating {
+		t.Error("the frame ticker did not start when a host came alive")
+	}
+	if cmd == nil {
+		t.Error("no command returned to drive the animation")
+	}
+
+	c.advance(flashDuration)
+	next, cmd = m.Update(frameMsg(time.Now()))
+	m = next.(Model)
+	if m.animating {
+		t.Error("the frame ticker kept running after the highlight faded")
+	}
+	if cmd != nil {
+		t.Error("a further frame was scheduled after the highlight faded")
+	}
+}
+
+func TestFlashIndexOutOfRangeIsSafe(t *testing.T) {
+	m, _ := newClockedModel([]monitor.HostView{up("h", ms(1), ms(1), 0)})
+	if got := m.flash(99); got != FlashNone {
+		t.Errorf("flash(99) = %v, want FlashNone", got)
+	}
+}
