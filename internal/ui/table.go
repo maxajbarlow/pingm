@@ -27,8 +27,38 @@ const (
 	wLoss    = 8
 	wStat    = 10
 	wTrend   = 2 // Arrow plus its leading space.
+	wFlash   = 2 // Left marker plus its trailing space.
 	gutter   = 2
 )
+
+// Flash is how strongly a row is highlighted after its host came alive.
+// FlashMax is the instant it happened and it counts down to FlashNone.
+type Flash int
+
+const (
+	FlashNone Flash = 0
+	FlashMax  Flash = Flash(len(flashRamp))
+)
+
+// marker renders the left-edge highlight for a row, or blank space when the
+// row is not flashing. It always occupies wFlash cells so nothing shifts.
+func (f Flash) marker() string {
+	if f <= FlashNone || f > FlashMax {
+		return pad(wFlash)
+	}
+	// FlashMax is freshest, so it maps to the first (brightest) ramp entry.
+	colour := flashRamp[int(FlashMax-f)]
+	return lipgloss.NewStyle().Foreground(colour).Render(glyphFlash) + pad(wFlash-1)
+}
+
+// hostStyle brightens a flashing row's name alongside the marker, so the
+// highlight reads as belonging to the row rather than sitting beside it.
+func (f Flash) hostStyle() lipgloss.Style {
+	if f <= FlashNone || f > FlashMax {
+		return styleHost
+	}
+	return lipgloss.NewStyle().Foreground(flashRamp[int(FlashMax-f)])
+}
 
 // Columns carries the one width that depends on the data.
 type Columns struct{ Host int }
@@ -51,7 +81,7 @@ func NewColumns(views []monitor.HostView) Columns {
 // TotalWidth is the full table width, used to size the rule under the header.
 func (c Columns) TotalWidth() int {
 	cols := []int{c.Host, wStatus, wLatency + wTrend, wLoss + wTrend, wStat, wStat + wTrend, wStat}
-	total := 0
+	total := wFlash
 	for _, w := range cols {
 		total += w
 	}
@@ -101,7 +131,7 @@ func TrendOf(curr, prev float64, hasPrev bool) Trend {
 func Header(c Columns) string {
 	// Columns carrying a trend arrow reserve wTrend cells to its right, so
 	// their label is aligned to the value's field rather than to the arrow.
-	labels := left(styleHeader, "HOST", c.Host) +
+	labels := pad(wFlash) + left(styleHeader, "HOST", c.Host) +
 		pad(gutter) + left(styleHeader, "STATUS", wStatus) +
 		pad(gutter) + right(styleHeader, "LATENCY", wLatency) + pad(wTrend) +
 		pad(gutter) + right(styleHeader, "LOSS", wLoss) + pad(wTrend) +
@@ -115,8 +145,8 @@ func Header(c Columns) string {
 
 // Row renders one host. Numeric columns are right-aligned so magnitudes line
 // up and an outlier is visible without reading every digit.
-func Row(v monitor.HostView, c Columns, lossTrend, avgTrend Trend) string {
-	host := left(styleHost, truncate(v.Display, c.Host), c.Host)
+func Row(v monitor.HostView, c Columns, lossTrend, avgTrend Trend, flash Flash) string {
+	host := flash.marker() + left(flash.hostStyle(), truncate(v.Display, c.Host), c.Host)
 
 	var status string
 	switch v.State {

@@ -11,6 +11,7 @@ const (
 	glyphBetter = "▼"
 	glyphWorse  = "▲"
 	glyphNone   = "—"
+	glyphFlash  = "▌"
 )
 
 // A restrained palette: status carries the only saturated colour, so a table
@@ -25,6 +26,17 @@ var (
 	colAccent = lipgloss.AdaptiveColor{Light: "25", Dark: "75"}
 	colWarn   = lipgloss.AdaptiveColor{Light: "130", Dark: "215"}
 )
+
+// flashRamp fades the marker on a row whose host has just come alive, from
+// freshest at index 0 to nearly gone at the end. Motion is what draws the eye
+// here, so the ramp can stay quiet rather than shouting in saturated green.
+var flashRamp = [5]lipgloss.AdaptiveColor{
+	{Light: "22", Dark: "46"},
+	{Light: "28", Dark: "41"},
+	{Light: "35", Dark: "35"},
+	{Light: "71", Dark: "29"},
+	{Light: "151", Dark: "23"},
+}
 
 var (
 	styleTitle   = lipgloss.NewStyle().Bold(true).Foreground(colAccent)

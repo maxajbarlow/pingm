@@ -23,6 +23,7 @@ a all  u up  d down  q quit   ·   ▼ better  ▲ worse
 
 - **Everything at once** — `pingm 10.0.0.0/24` watches a whole subnet in one table
 - **Honest status** — **✔ UP** / **✘ DOWN** always reflect the *latest* probe, not the host's history
+- **Recovery highlight** — a host that comes alive briefly lights up, so you catch it without staring
 - **Filter by state** — `-f down` shows only what is broken, or press `d` while it runs
 - **Comma-separated hosts** — `pingm 8.8.8.8,1.1.1.1,router.lan`
 - **IP ranges** — `pingm 10.0.0.1-10.0.0.20`
@@ -125,6 +126,26 @@ Only LATENCY, which is a *current* reading, blanks out.
 **LOSS** is tinted once it is non-zero, so a host that is still nominally up
 but dropping packets stands out — usually the most interesting state on the
 table.
+
+### When a host comes alive
+
+A host that starts answering — a recovery, or its very first reply — gets a
+marker down its left edge that fades out over about a second:
+
+```
+  10.0.0.1   ✔ UP       0.41 ms       0.0%      0.32 ms     0.44 ms      0.61 ms
+▌ 10.0.0.99  ✔ UP       0.18 ms      62.5% ▼    0.18 ms     0.18 ms      0.18 ms
+  10.0.0.7   ✘ DOWN           —     100.0%            —           —            —
+```
+
+Motion is what catches the eye, so the highlight stays deliberately quiet
+rather than flooding the row with colour. The animation frames only run while
+something is actually fading — an idle table emits nothing at all, exactly as
+before.
+
+Hosts going *down* are not highlighted, on the grounds that a table full of
+flapping hosts would strobe. The `✘ DOWN` status and the rising loss figure
+already mark those, and `-f down` isolates them.
 
 **LOSS** and **AVG** carry a trend arrow comparing them with the previous
 refresh: **▼** when the value fell (better), **▲** when it rose (worse). No
