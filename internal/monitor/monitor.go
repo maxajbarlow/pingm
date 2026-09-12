@@ -22,10 +22,19 @@ type HostView struct {
 	ResolveErr error
 }
 
+// MaxAutoTimeout caps the timeout derived from the interval, so a long
+// interval cannot leave a dead host looking merely slow for minutes.
+const MaxAutoTimeout = 2 * time.Second
+
 // Monitor probes a set of hosts and maintains their running statistics.
 type Monitor struct {
 	prober  *Prober
 	targets []Target
+
+	// autoTimeout means the reply deadline follows the interval. It is false
+	// when the caller pinned a timeout explicitly, which must then survive an
+	// interval change.
+	autoTimeout bool
 
 	mu    sync.RWMutex
 	stats []Stats
@@ -35,8 +44,13 @@ type Monitor struct {
 // avoid depending on DNS.
 type Resolver func(host string) (net.IP, error)
 
-// New resolves every host and opens the probe socket.
+// New resolves every host and opens the probe socket. A timeout of zero means
+// derive it from the interval and keep it in step as the interval changes.
 func New(hosts []string, interval, timeout time.Duration, resolve Resolver) (*Monitor, error) {
+	auto := timeout <= 0
+	if auto {
+		timeout = autoTimeoutFor(interval)
+	}
 	if resolve == nil {
 		resolve = resolveIPv4
 	}
@@ -54,10 +68,33 @@ func New(hosts []string, interval, timeout time.Duration, resolve Resolver) (*Mo
 		return nil, err
 	}
 	return &Monitor{
-		prober:  prober,
-		targets: targets,
-		stats:   make([]Stats, len(hosts)),
+		prober:      prober,
+		targets:     targets,
+		autoTimeout: auto,
+		stats:       make([]Stats, len(hosts)),
 	}, nil
+}
+
+func autoTimeoutFor(interval time.Duration) time.Duration {
+	if interval < MaxAutoTimeout {
+		return interval
+	}
+	return MaxAutoTimeout
+}
+
+// Interval is the current gap between probes for a given host.
+func (m *Monitor) Interval() time.Duration { return m.prober.Interval() }
+
+// SetInterval changes the probe cadence while running, carrying the reply
+// deadline with it unless the caller pinned one.
+func (m *Monitor) SetInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	m.prober.SetInterval(d)
+	if m.autoTimeout {
+		m.prober.SetTimeout(autoTimeoutFor(d))
+	}
 }
 
 func resolveIPv4(host string) (net.IP, error) {

@@ -75,15 +75,70 @@ const (
 	frameInterval = 90 * time.Millisecond
 )
 
-// Source supplies host snapshots. An interface rather than *monitor.Monitor so
-// the model can be exercised without opening a socket.
-type Source interface {
+// Controller is the part of the monitor the table needs: a consistent
+// snapshot to draw, and the ability to retune the probe cadence. An interface
+// rather than *monitor.Monitor so the model can be exercised without opening
+// a socket.
+type Controller interface {
 	Snapshot() []monitor.HostView
+	SetInterval(time.Duration)
+}
+
+// intervalLadder is what the +/- keys step through: a 1-2-5 sequence spanning
+// 100ms to 10s. Stepping by rungs rather than by a fixed amount means the
+// whole useful range is a few presses away at either end, and every stop is a
+// round number worth reading in the footer.
+var intervalLadder = [...]time.Duration{
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+	500 * time.Millisecond,
+	1 * time.Second,
+	2 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+}
+
+// slower returns the next rung above d. An interval that sits between rungs
+// (from -i 300ms, say) moves to the next rung up rather than snapping first,
+// and one already at or beyond the top is left alone.
+func slower(d time.Duration) time.Duration {
+	for _, step := range intervalLadder {
+		if step > d {
+			return step
+		}
+	}
+	return d
+}
+
+// faster returns the next rung below d, leaving anything at or below the
+// bottom rung alone — including an interval the user deliberately set lower
+// than the ladder reaches.
+func faster(d time.Duration) time.Duration {
+	for i := len(intervalLadder) - 1; i >= 0; i-- {
+		if intervalLadder[i] < d {
+			return intervalLadder[i]
+		}
+	}
+	return d
+}
+
+// refreshFor keeps redrawing in step with probing: repainting faster only
+// reprints identical numbers, and the trend arrows are defined against the
+// previous refresh.
+func refreshFor(interval time.Duration) time.Duration {
+	switch {
+	case interval < 100*time.Millisecond:
+		return 100 * time.Millisecond
+	case interval > 2*time.Second:
+		return 2 * time.Second
+	default:
+		return interval
+	}
 }
 
 // Model is the Bubble Tea model driving the live table.
 type Model struct {
-	mon      Source
+	mon      Controller
 	finished <-chan struct{}
 
 	filter   Filter
@@ -115,18 +170,8 @@ type Model struct {
 
 // NewModel builds the table model. finished is closed when probing has stopped
 // of its own accord, which only happens in -c mode.
-func NewModel(mon Source, filter Filter, interval time.Duration, limit int, finished <-chan struct{}) Model {
+func NewModel(mon Controller, filter Filter, interval time.Duration, limit int, finished <-chan struct{}) Model {
 	views := mon.Snapshot()
-
-	// Redraw in step with probing: refreshing faster only reprints identical
-	// numbers, and the trend arrows are defined against the previous refresh.
-	refresh := interval
-	if refresh < 100*time.Millisecond {
-		refresh = 100 * time.Millisecond
-	}
-	if refresh > 2*time.Second {
-		refresh = 2 * time.Second
-	}
 
 	return Model{
 		mon:      mon,
@@ -134,7 +179,7 @@ func NewModel(mon Source, filter Filter, interval time.Duration, limit int, fini
 		filter:   filter,
 		interval: interval,
 		limit:    limit,
-		refresh:  refresh,
+		refresh:  refreshFor(interval),
 		views:    views,
 		prevLoss: make([]float64, len(views)),
 		prevAvg:  make([]float64, len(views)),
@@ -185,6 +230,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.filter = FilterUp
 		case "d":
 			m.filter = FilterDown
+		case "+", "=":
+			// "=" is the unshifted key, so + works without reaching for shift.
+			m.setInterval(slower(m.interval))
+		case "-", "_":
+			m.setInterval(faster(m.interval))
 		}
 		return m, nil
 
@@ -258,6 +308,17 @@ func (m Model) anyFlashing() bool {
 		}
 	}
 	return false
+}
+
+// setInterval retunes probing and redrawing together. A no-op change is
+// skipped so pressing past either end of the ladder costs nothing.
+func (m *Model) setInterval(d time.Duration) {
+	if d == m.interval || d <= 0 {
+		return
+	}
+	m.interval = d
+	m.refresh = refreshFor(d)
+	m.mon.SetInterval(d)
 }
 
 func (m Model) matching() []int {
@@ -373,6 +434,7 @@ func (m Model) keyHints() string {
 		key("a", "all"),
 		key("u", "up"),
 		key("d", "down"),
+		key("+/-", "rate"),
 		key("q", "quit"),
 	}
 	legend := styleBetter.Render(glyphBetter) + styleFooter.Render(" better  ") +

@@ -167,3 +167,108 @@ func TestNewUsesTheDefaultResolverWhenNoneGiven(t *testing.T) {
 		t.Error("default resolver did not resolve 127.0.0.1")
 	}
 }
+
+// --- Runtime interval changes ---------------------------------------------
+
+func TestTimeoutDefaultsToTheInterval(t *testing.T) {
+	m, err := New([]string{"a"}, 700*time.Millisecond, 0, fixedResolver("127.0.0.1"))
+	if err != nil {
+		t.Skipf("cannot open a probe socket here: %v", err)
+	}
+	defer m.Close()
+
+	if got := m.prober.Timeout(); got != 700*time.Millisecond {
+		t.Errorf("Timeout = %v, want it derived from the interval", got)
+	}
+}
+
+func TestDerivedTimeoutIsCapped(t *testing.T) {
+	m, err := New([]string{"a"}, time.Minute, 0, fixedResolver("127.0.0.1"))
+	if err != nil {
+		t.Skipf("cannot open a probe socket here: %v", err)
+	}
+	defer m.Close()
+
+	if got := m.prober.Timeout(); got != MaxAutoTimeout {
+		t.Errorf("Timeout = %v, want it capped at %v", got, MaxAutoTimeout)
+	}
+}
+
+func TestSetIntervalCarriesTheDerivedTimeout(t *testing.T) {
+	m, err := New([]string{"a"}, time.Second, 0, fixedResolver("127.0.0.1"))
+	if err != nil {
+		t.Skipf("cannot open a probe socket here: %v", err)
+	}
+	defer m.Close()
+
+	m.SetInterval(200 * time.Millisecond)
+	if got := m.Interval(); got != 200*time.Millisecond {
+		t.Errorf("Interval = %v, want 200ms", got)
+	}
+	if got := m.prober.Timeout(); got != 200*time.Millisecond {
+		t.Errorf("Timeout = %v, want it to follow the interval", got)
+	}
+}
+
+// A timeout the user pinned with -t must survive an interval change.
+func TestExplicitTimeoutSurvivesAnIntervalChange(t *testing.T) {
+	m, err := New([]string{"a"}, time.Second, 750*time.Millisecond, fixedResolver("127.0.0.1"))
+	if err != nil {
+		t.Skipf("cannot open a probe socket here: %v", err)
+	}
+	defer m.Close()
+
+	m.SetInterval(5 * time.Second)
+	if got := m.prober.Timeout(); got != 750*time.Millisecond {
+		t.Errorf("Timeout = %v, want the pinned 750ms to survive", got)
+	}
+}
+
+func TestSetIntervalIgnoresNonPositiveValues(t *testing.T) {
+	m, err := New([]string{"a"}, time.Second, 0, fixedResolver("127.0.0.1"))
+	if err != nil {
+		t.Skipf("cannot open a probe socket here: %v", err)
+	}
+	defer m.Close()
+
+	for _, bad := range []time.Duration{0, -time.Second} {
+		m.SetInterval(bad)
+		if got := m.Interval(); got != time.Second {
+			t.Errorf("SetInterval(%v) changed the interval to %v", bad, got)
+		}
+	}
+}
+
+// Speeding up must take effect at once rather than after the old, slower
+// interval has elapsed — that is the whole point of the shortcut.
+func TestSpeedingUpTakesEffectImmediately(t *testing.T) {
+	m, err := New([]string{"127.0.0.1"}, 30*time.Second, 500*time.Millisecond, fixedResolver("127.0.0.1"))
+	if err != nil {
+		t.Skipf("cannot open a probe socket here: %v", err)
+	}
+	defer m.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { m.Run(ctx, 0); close(done) }()
+
+	// First round goes out immediately; the next would be 30s away.
+	time.Sleep(300 * time.Millisecond)
+	m.SetInterval(100 * time.Millisecond)
+	time.Sleep(700 * time.Millisecond)
+
+	sent := m.Snapshot()[0]
+	cancel()
+	<-done
+
+	// At 30s we would have exactly one round; at 100ms, several.
+	if sent.State == StateWaiting {
+		t.Fatal("no probe completed at all")
+	}
+	m.mu.RLock()
+	total := m.stats[0].Sent
+	m.mu.RUnlock()
+	if total < 3 {
+		t.Errorf("only %d probes sent, want several — the new interval did not take effect", total)
+	}
+}

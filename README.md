@@ -106,7 +106,22 @@ Durations take a unit: `250ms`, `2s`, `1m`.
 | `a` | Show all hosts |
 | `u` | Show only hosts that are up |
 | `d` | Show only hosts that are down |
+| `+` | Probe slower (`=` works too, so no shift needed) |
+| `-` | Probe faster (`_` works too) |
 | `q` | Quit (`Esc` and `Ctrl-C` also work) |
+
+`+` and `-` step through `100ms · 200ms · 500ms · 1s · 2s · 5s · 10s`, so the
+whole useful range is a few presses away at either end. Speed up when you are
+watching something flap, slow down when you just want it ticking over in a
+corner. The footer shows the current cadence, and a change takes effect at
+once — speeding up does not wait out the old interval first.
+
+An interval set with `-i` that is not on the ladder steps to the neighbouring
+rung, and one deliberately set outside it (`-i 25ms`, `-i 1m`) is never pushed
+further in that direction.
+
+Unless `-t` pinned a timeout, the reply deadline follows the interval, so a
+host that stops answering is still reported promptly at any cadence.
 
 ## Reading the table
 

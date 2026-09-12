@@ -14,9 +14,12 @@ func ms(n int) time.Duration { return time.Duration(n) * time.Millisecond }
 // fakeSource replays scripted snapshots so the model can be driven without a
 // socket or a terminal.
 type fakeSource struct {
-	frames [][]monitor.HostView
-	at     int
+	frames    [][]monitor.HostView
+	at        int
+	intervals []time.Duration // Every SetInterval the model asked for.
 }
+
+func (f *fakeSource) SetInterval(d time.Duration) { f.intervals = append(f.intervals, d) }
 
 // Snapshot returns the next scripted frame, holding on the last one.
 func (f *fakeSource) Snapshot() []monitor.HostView {
@@ -461,5 +464,187 @@ func TestFlashIndexOutOfRangeIsSafe(t *testing.T) {
 	m, _ := newClockedModel([]monitor.HostView{up("h", ms(1), ms(1), 0)})
 	if got := m.flash(99); got != FlashNone {
 		t.Errorf("flash(99) = %v, want FlashNone", got)
+	}
+}
+
+// --- Interval shortcuts ---------------------------------------------------
+
+func press(m Model, key string) Model {
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+	return next.(Model)
+}
+
+func TestLadderStepsThroughRoundNumbers(t *testing.T) {
+	want := []time.Duration{
+		100 * time.Millisecond, 200 * time.Millisecond, 500 * time.Millisecond,
+		time.Second, 2 * time.Second, 5 * time.Second, 10 * time.Second,
+	}
+	got := []time.Duration{intervalLadder[0]}
+	for d := intervalLadder[0]; slower(d) != d; {
+		d = slower(d)
+		got = append(got, d)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ladder climbed through %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("rung %d = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestLadderIsSymmetric(t *testing.T) {
+	for _, d := range intervalLadder {
+		if up := slower(d); up != d {
+			if back := faster(up); back != d {
+				t.Errorf("slower(%v)=%v then faster gave %v, want %v", d, up, back, d)
+			}
+		}
+	}
+}
+
+func TestLadderClampsAtBothEnds(t *testing.T) {
+	fastest, slowest := intervalLadder[0], intervalLadder[len(intervalLadder)-1]
+	if got := faster(fastest); got != fastest {
+		t.Errorf("faster(%v) = %v, want it clamped", fastest, got)
+	}
+	if got := slower(slowest); got != slowest {
+		t.Errorf("slower(%v) = %v, want it clamped", slowest, got)
+	}
+}
+
+// An interval the user chose off-ladder must step to a neighbouring rung
+// rather than snapping somewhere surprising.
+func TestOffLadderIntervalStepsToTheNeighbouringRung(t *testing.T) {
+	cases := []struct {
+		start, up, down time.Duration
+	}{
+		{300 * time.Millisecond, 500 * time.Millisecond, 200 * time.Millisecond},
+		{1500 * time.Millisecond, 2 * time.Second, time.Second},
+		{7 * time.Second, 10 * time.Second, 5 * time.Second},
+	}
+	for _, tc := range cases {
+		if got := slower(tc.start); got != tc.up {
+			t.Errorf("slower(%v) = %v, want %v", tc.start, got, tc.up)
+		}
+		if got := faster(tc.start); got != tc.down {
+			t.Errorf("faster(%v) = %v, want %v", tc.start, got, tc.down)
+		}
+	}
+}
+
+// A deliberately chosen interval below the ladder must not be sped up further.
+func TestIntervalBelowTheLadderIsNotSpedUp(t *testing.T) {
+	if got := faster(25 * time.Millisecond); got != 25*time.Millisecond {
+		t.Errorf("faster(25ms) = %v, want it left alone", got)
+	}
+	if got := slower(25 * time.Millisecond); got != 100*time.Millisecond {
+		t.Errorf("slower(25ms) = %v, want the first rung", got)
+	}
+}
+
+func TestIntervalAboveTheLadderIsNotSlowedFurther(t *testing.T) {
+	if got := slower(time.Minute); got != time.Minute {
+		t.Errorf("slower(1m) = %v, want it left alone", got)
+	}
+	if got := faster(time.Minute); got != 10*time.Second {
+		t.Errorf("faster(1m) = %v, want the top rung", got)
+	}
+}
+
+func newIntervalModel(start time.Duration) (Model, *fakeSource) {
+	src := &fakeSource{frames: [][]monitor.HostView{{up("h", ms(5), ms(5), 0)}}}
+	m := NewModel(src, FilterAll, start, 0, nil)
+	m.width, m.height = 100, 30
+	return m, src
+}
+
+func TestPlusSlowsDownAndMinusSpeedsUp(t *testing.T) {
+	m, src := newIntervalModel(time.Second)
+
+	m = press(m, "+")
+	if m.interval != 2*time.Second {
+		t.Errorf("after + interval = %v, want 2s", m.interval)
+	}
+	m = press(m, "-")
+	m = press(m, "-")
+	if m.interval != 500*time.Millisecond {
+		t.Errorf("after two - interval = %v, want 500ms", m.interval)
+	}
+
+	want := []time.Duration{2 * time.Second, time.Second, 500 * time.Millisecond}
+	if len(src.intervals) != len(want) {
+		t.Fatalf("monitor was told %v, want %v", src.intervals, want)
+	}
+	for i := range want {
+		if src.intervals[i] != want[i] {
+			t.Errorf("SetInterval call %d = %v, want %v", i, src.intervals[i], want[i])
+		}
+	}
+}
+
+// "=" is the unshifted key, so + works without reaching for shift.
+func TestUnshiftedKeysWorkToo(t *testing.T) {
+	m, _ := newIntervalModel(time.Second)
+	if m = press(m, "="); m.interval != 2*time.Second {
+		t.Errorf("after = interval = %v, want 2s", m.interval)
+	}
+	if m = press(m, "_"); m.interval != time.Second {
+		t.Errorf("after _ interval = %v, want 1s", m.interval)
+	}
+}
+
+// Pressing past either end must not keep poking the monitor.
+func TestPressingPastTheEndDoesNothing(t *testing.T) {
+	m, src := newIntervalModel(10 * time.Second)
+	for i := 0; i < 3; i++ {
+		m = press(m, "+")
+	}
+	if m.interval != 10*time.Second {
+		t.Errorf("interval = %v, want it pinned at 10s", m.interval)
+	}
+	if len(src.intervals) != 0 {
+		t.Errorf("monitor was retuned %v for a no-op change", src.intervals)
+	}
+}
+
+func TestChangingIntervalRetunesTheRedrawRate(t *testing.T) {
+	m, _ := newIntervalModel(time.Second)
+
+	m = press(m, "+") // 2s
+	if m.refresh != 2*time.Second {
+		t.Errorf("refresh = %v at a 2s interval, want 2s", m.refresh)
+	}
+	m = press(m, "+") // 5s — redraw must stay capped
+	if m.refresh != 2*time.Second {
+		t.Errorf("refresh = %v at a 5s interval, want it capped at 2s", m.refresh)
+	}
+	for i := 0; i < 5; i++ {
+		m = press(m, "-") // down to 100ms
+	}
+	if m.interval != 100*time.Millisecond {
+		t.Fatalf("interval = %v, want 100ms", m.interval)
+	}
+	if m.refresh != 100*time.Millisecond {
+		t.Errorf("refresh = %v at a 100ms interval, want 100ms", m.refresh)
+	}
+}
+
+func TestFooterShowsTheCurrentInterval(t *testing.T) {
+	m, _ := newIntervalModel(time.Second)
+	if out := plain(m.View()); !strings.Contains(out, "Interval: 1s") {
+		t.Errorf("footer does not show the starting interval:\n%s", out)
+	}
+	m = press(m, "+")
+	if out := plain(m.View()); !strings.Contains(out, "Interval: 2s") {
+		t.Errorf("footer did not follow the change:\n%s", out)
+	}
+}
+
+func TestKeyHintsMentionTheRateKeys(t *testing.T) {
+	m, _ := newIntervalModel(time.Second)
+	if out := plain(m.View()); !strings.Contains(out, "+/-") {
+		t.Errorf("key hints do not mention +/-:\n%s", out)
 	}
 }

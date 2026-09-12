@@ -62,11 +62,9 @@ func (o options) validate() (ui.Filter, time.Duration, error) {
 		return 0, 0, errors.New("timeout cannot be negative")
 	}
 
-	timeout := o.timeout
-	if timeout == 0 {
-		timeout = min(o.interval, 2*time.Second)
-	}
-	return filter, timeout, nil
+	// Zero is passed straight through: the monitor then derives the timeout
+	// from the interval and keeps the two in step as the interval changes.
+	return filter, o.timeout, nil
 }
 
 func main() {
@@ -204,6 +202,7 @@ Options:
 
 Keys while running:
   a / u / d     show all hosts, only up, or only down
+  + / -         probe slower or faster, stepping 100ms .. 10s
   q             quit
 
 Examples:

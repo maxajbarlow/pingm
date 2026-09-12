@@ -9,23 +9,19 @@ import (
 	"github.com/maxajbarlow/pingm/internal/ui"
 )
 
-func TestValidateDefaultsTimeoutToTheInterval(t *testing.T) {
-	_, timeout, err := options{interval: 700 * time.Millisecond, filter: "all"}.validate()
-	if err != nil {
-		t.Fatalf("validate errored: %v", err)
-	}
-	if timeout != 700*time.Millisecond {
-		t.Errorf("timeout = %v, want it to default to the interval", timeout)
-	}
-}
-
-func TestValidateCapsTheDefaultTimeout(t *testing.T) {
-	_, timeout, err := options{interval: time.Minute, filter: "all"}.validate()
-	if err != nil {
-		t.Fatalf("validate errored: %v", err)
-	}
-	if timeout != 2*time.Second {
-		t.Errorf("timeout = %v, want it capped at 2s", timeout)
+// An unset -t is passed through as zero, which is how the monitor is told to
+// derive the timeout from the interval and keep the two in step as the
+// interval changes at runtime. The derivation itself is covered in the
+// monitor package.
+func TestValidatePassesAnUnsetTimeoutThroughAsAuto(t *testing.T) {
+	for _, interval := range []time.Duration{700 * time.Millisecond, time.Minute} {
+		_, timeout, err := options{interval: interval, filter: "all"}.validate()
+		if err != nil {
+			t.Fatalf("validate errored: %v", err)
+		}
+		if timeout != 0 {
+			t.Errorf("timeout = %v at interval %v, want 0 meaning auto", timeout, interval)
+		}
 	}
 }
 
