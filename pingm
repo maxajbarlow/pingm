@@ -10,7 +10,7 @@
 #   pingm google.com,cloudflare.com,8.8.8.1-8.8.8.4
 #
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 MAX_HOSTS=256
 CONFIRM_THRESHOLD=50
 INTERVAL=1
@@ -23,6 +23,35 @@ GREEN=$'\033[32m'
 BOLD=$'\033[1m'
 DIM=$'\033[2m'
 RESET=$'\033[0m'
+
+CLEAR_SCREEN=$'\033[H\033[2J'
+CLEAR_EOL=$'\033[K'
+WRAP_OFF=$'\033[?7l'
+WRAP_ON=$'\033[?7h'
+
+# ── Glyphs ─────────────────────────────────────────────────────────
+# Column padding is measured with ${#var}, which counts *characters* only
+# under a UTF-8 locale. Under LC_ALL=C bash counts bytes instead, so a
+# 3-byte glyph would eat 3 columns of padding and shear the table. Detect
+# that once and fall back to ASCII rather than drawing a broken grid.
+G_DASH="—" G_UP="✔" G_DOWN="✘" G_BETTER="▼" G_WORSE="▲" G_LINE="─"
+if (( ${#G_DASH} != 1 )); then
+    G_DASH="-" G_UP="+" G_DOWN="x" G_BETTER="v" G_WORSE="^" G_LINE="-"
+fi
+
+# ── Layout ─────────────────────────────────────────────────────────
+# Fixed chrome around the host rows: the header is title / blank / column
+# labels / rule, and the footer is blank / settings / legend.
+HEADER_LINES=4
+FOOTER_LINES=3
+
+# Column widths (visible characters), excluding the 2-space gutters.
+W_STATUS=8
+W_LATENCY=12
+W_LOSS=10
+W_MIN=10
+W_AVG=12
+W_MAX=10
 
 # ── Usage ──────────────────────────────────────────────────────────
 usage() {
@@ -194,45 +223,78 @@ get_timeout_flag() {
 }
 
 # ── Ping Worker (runs as a background process per host) ────────────
+#
+# Each worker owns one data file and is the only writer. It publishes a
+# single whitespace-separated line of *display-ready* values:
+#
+#   ok sent recv last min max avg loss10
+#
+#   ok      1 if the most recent probe replied, 0 if it did not
+#   last    RTT of the most recent probe, or "-" if it timed out
+#   avg     running mean, pre-formatted to one decimal
+#   loss10  packet loss in tenths of a percent (integer)
+#
+# Doing the float maths here — once per ping — is what lets draw_table run
+# without forking a single subprocess.
 ping_worker() {
     local host="$1" datafile="$2" tflag="$3"
-    local sent=0 recv=0 last="-"
-    local mn="-" mx="-" sm="0"
 
-    # Initialize datafile
-    echo "0 0 - - - 0" > "$datafile"
+    # Subshells inherit the parent's traps for EXIT; clear them so a worker
+    # being killed on shutdown can never run cleanup() and delete WORK_DIR
+    # out from under its siblings.
+    trap - INT TERM EXIT
+
+    local sent=0 recv=0 ok=0 loss10=0
+    local last="-" mn="-" mx="-" avg="-" sm="0"
+
+    # Publish an initial row so the table can show WAIT instead of a gap.
+    echo "0 0 0 - - - - 0" > "$datafile"
 
     while true; do
         sent=$((sent + 1))
 
         # Run a single ping (timeout flag varies by OS)
         # shellcheck disable=SC2086
-        local out
+        local out=""
         out=$(ping -c 1 $tflag "$host" 2>/dev/null) || true
 
-        # Extract round-trip time
-        local rtt
-        rtt=$(echo "$out" | grep -oE 'time=[0-9.]+' | head -1 | cut -d= -f2)
+        # Extract round-trip time. Matching in-shell avoids forking
+        # grep/head/cut on every probe of every host.
+        local rtt=""
+        if [[ "$out" =~ time=([0-9.]+) ]]; then
+            rtt="${BASH_REMATCH[1]}"
+        fi
 
         if [[ -n "$rtt" ]]; then
+            ok=1
             recv=$((recv + 1))
             last="$rtt"
 
-            # Update min, max, and cumulative sum via awk (for float math)
-            read -r mn mx sm <<< "$(awk \
-                -v r="$rtt" -v mn="$mn" -v mx="$mx" -v sm="$sm" \
+            # One awk pass folds min, max, running sum and mean together.
+            read -r mn mx sm avg <<< "$(awk \
+                -v r="$rtt" -v mn="$mn" -v mx="$mx" -v sm="$sm" -v n="$recv" \
                 'BEGIN {
                     v = r + 0
                     if (mn == "-" || v < mn + 0) mn = r
                     if (mx == "-" || v > mx + 0) mx = r
                     sm = sm + v
-                    printf "%s %s %.3f", mn, mx, sm
+                    printf "%s %s %.3f %.1f", mn, mx, sm, sm / n
                 }')"
+        else
+            # The probe timed out: this host is down *right now*. Earlier
+            # replies do not make it up — only the latest probe decides
+            # status. Historical min/max/avg deliberately stay put.
+            ok=0
+            last="-"
         fi
 
-        # Atomic write: write to .tmp then rename to avoid partial reads
-        echo "$sent $recv $last $mn $mx $sm" > "${datafile}.tmp"
-        mv "${datafile}.tmp" "$datafile"
+        # Loss in tenths of a percent, integer maths only.
+        loss10=$(( (sent - recv) * 1000 / sent ))
+
+        # Atomic publish: write to .tmp then rename, so a reader mid-frame
+        # can never observe a half-written line.
+        echo "$ok $sent $recv $last $mn $mx $avg $loss10" > "${datafile}.tmp"
+        mv -f "${datafile}.tmp" "$datafile"
 
         # Stop if we've reached the requested count
         if (( COUNT > 0 && sent >= COUNT )); then
@@ -243,153 +305,238 @@ ping_worker() {
     done
 }
 
-# ── Trend Helpers ──────────────────────────────────────────────────
-# Compare a metric to its previous reading (lower is always better here:
-# less packet loss, less latency). Sets TREND_COLOR / TREND_ARROW.
+# ── Cell Formatting ────────────────────────────────────────────────
+# Build one table cell of a fixed *visible* width. The padding is measured
+# on the bare text and the colour codes are wrapped around it afterwards,
+# so ANSI escapes never count toward the column width. Result in CELL.
+fmt_cell() {
+    local text="$1" width="$2" color="$3" arrow="$4"
+    [[ -n "$arrow" ]] && text="${text} ${arrow}"
+
+    local pad=$(( width - ${#text} ))
+    (( pad < 0 )) && pad=0
+
+    local spaces=""
+    printf -v spaces '%*s' "$pad" ''
+
+    if [[ -n "$color" ]]; then
+        CELL="${color}${text}${RESET}${spaces}"
+    else
+        CELL="${text}${spaces}"
+    fi
+}
+
+# ── Trend ──────────────────────────────────────────────────────────
+# Compare a metric to its previous reading. Both arguments are scaled
+# integers (tenths), so this is pure shell arithmetic — no awk. Lower is
+# always better here: less packet loss, less latency.
 calc_trend() {
     local curr="$1" prev="$2"
     TREND_COLOR=""
     TREND_ARROW=""
     [[ -z "$prev" ]] && return
 
-    local cmp
-    cmp=$(awk -v c="$curr" -v p="$prev" 'BEGIN {
-        if (c + 0 < p + 0)      print "down"
-        else if (c + 0 > p + 0) print "up"
-        else                    print "same"
-    }')
-
-    case "$cmp" in
-        down) TREND_COLOR="$GREEN"; TREND_ARROW="▼" ;;  # better
-        up)   TREND_COLOR="$RED";   TREND_ARROW="▲" ;;  # worse
-    esac
+    if (( curr < prev )); then
+        TREND_COLOR="$GREEN"; TREND_ARROW="$G_BETTER"   # better
+    elif (( curr > prev )); then
+        TREND_COLOR="$RED";   TREND_ARROW="$G_WORSE"    # worse
+    fi
 }
 
-# Print a value (optionally with a colored trend arrow) padded to a fixed
-# visible width, without letting ANSI codes throw off printf's own padding.
-print_metric() {
-    local text="$1" width="$2" color="$3" arrow="$4"
-    local full="$text"
-    [[ -n "$arrow" ]] && full="${text} ${arrow}"
+# ── Layout ─────────────────────────────────────────────────────────
+# Work out how many host rows actually fit on screen. In-place cursor
+# addressing only stays correct while the table fits the viewport — one
+# line of overflow scrolls the terminal and every row address drifts — so
+# oversized host lists get clipped with a count of what was hidden.
+compute_layout() {
+    TERM_LINES=$(tput lines 2>/dev/null) || TERM_LINES=24
+    TERM_COLS=$(tput cols 2>/dev/null) || TERM_COLS=80
+    is_uint "$TERM_LINES" || TERM_LINES=24
+    is_uint "$TERM_COLS"  || TERM_COLS=80
 
-    local pad=$(( width - ${#full} ))
-    (( pad < 0 )) && pad=0
+    local total=${#HOSTS[@]}
+    local avail=$(( TERM_LINES - HEADER_LINES - FOOTER_LINES ))
+    (( avail < 1 )) && avail=1
 
-    if [[ -n "$color" ]]; then
-        printf '%b' "${color}${full}${RESET}"
+    if (( total <= avail )); then
+        VISIBLE_ROWS=$total
+        HIDDEN_ROWS=0
     else
-        printf '%s' "$full"
+        # One row is surrendered to the "N more" notice.
+        VISIBLE_ROWS=$(( avail - 1 ))
+        (( VISIBLE_ROWS < 1 )) && VISIBLE_ROWS=1
+        HIDDEN_ROWS=$(( total - VISIBLE_ROWS ))
     fi
-    printf '%*s' "$pad" ""
+
+    # Where the cursor parks after each frame. Derived here because it
+    # depends on the clipped row count, not the raw host count.
+    FOOTER_END_LINE=$(( HEADER_LINES + VISIBLE_ROWS + FOOTER_LINES ))
+    (( HIDDEN_ROWS > 0 )) && FOOTER_END_LINE=$(( FOOTER_END_LINE + 1 ))
+}
+
+# ── Static Chrome ──────────────────────────────────────────────────
+# Header and footer only change on resize, so they are rendered once into
+# HEADER_BLOCK / FOOTER_BLOCK and replayed on full redraws.
+build_chrome() {
+    local tw=$(( HOST_W + W_STATUS + W_LATENCY + W_LOSS + W_MIN + W_AVG + W_MAX + 12 ))
+    (( tw > TERM_COLS )) && tw=$TERM_COLS
+
+    local rule=""
+    printf -v rule '%*s' "$tw" ''
+    rule="${rule// /$G_LINE}"
+
+    local labels=""
+    fmt_cell "HOST"    "$HOST_W"    "" ""; labels="${CELL}  "
+    fmt_cell "STATUS"  "$W_STATUS"  "" ""; labels="${labels}${CELL}  "
+    fmt_cell "LATENCY" "$W_LATENCY" "" ""; labels="${labels}${CELL}  "
+    fmt_cell "LOSS"    "$W_LOSS"    "" ""; labels="${labels}${CELL}  "
+    fmt_cell "MIN"     "$W_MIN"     "" ""; labels="${labels}${CELL}  "
+    fmt_cell "AVG"     "$W_AVG"     "" ""; labels="${labels}${CELL}  "
+    fmt_cell "MAX"     "$W_MAX"     "" ""; labels="${labels}${CELL}"
+
+    HEADER_BLOCK=$'\033[H'
+    HEADER_BLOCK="${HEADER_BLOCK}${BOLD}pingm${RESET} — Live Multi-Ping   ${DIM}[Ctrl+C to stop]${RESET}${CLEAR_EOL}"$'\n'
+    HEADER_BLOCK="${HEADER_BLOCK}${CLEAR_EOL}"$'\n'
+    HEADER_BLOCK="${HEADER_BLOCK}${BOLD}${labels}${RESET}${CLEAR_EOL}"$'\n'
+    HEADER_BLOCK="${HEADER_BLOCK}${DIM}${rule}${RESET}${CLEAR_EOL}"
+
+    local settings="Interval: ${INTERVAL}s"
+    (( COUNT > 0 )) && settings="${settings} | Count: ${COUNT}"
+    [[ -n "$STATUS_NOTE" ]] && settings="${settings} | ${STATUS_NOTE}"
+
+    # Must not end in a newline: the footer can sit on the terminal's last
+    # line, and a trailing newline there would scroll the whole table up.
+    FOOTER_BLOCK=""
+    if (( HIDDEN_ROWS > 0 )); then
+        FOOTER_BLOCK="${DIM}… ${HIDDEN_ROWS} more host(s) hidden — resize the terminal to show them${RESET}${CLEAR_EOL}"$'\n'
+    fi
+    FOOTER_BLOCK="${FOOTER_BLOCK}${CLEAR_EOL}"$'\n'
+    FOOTER_BLOCK="${FOOTER_BLOCK}${DIM}${settings}${RESET}${CLEAR_EOL}"$'\n'
+    FOOTER_BLOCK="${FOOTER_BLOCK}${DIM}Trend vs. last refresh:${RESET} ${GREEN}${G_BETTER} better${RESET}   ${RED}${G_WORSE} worse${RESET}${CLEAR_EOL}"
+}
+
+# ── Render One Row ─────────────────────────────────────────────────
+# Produces the full line for host $1 in ROW. Returns 1 if the worker's
+# data file could not be read cleanly, so the caller can leave whatever
+# that row is already showing rather than flashing a broken line.
+render_row() {
+    local idx="$1"
+    local h="${HOSTS[$idx]}" df="${DATA_FILES[$idx]}"
+    local ok sent recv last mn mx avg loss10
+
+    ROW=""
+    [[ -r "$df" ]] || return 1
+    read -r ok sent recv last mn mx avg loss10 < "$df" 2>/dev/null || return 1
+    is_uint "$sent" && is_uint "$loss10" || return 1
+
+    # Force base 10. Bash reads a leading-zero value such as "08" as an octal
+    # constant and aborts the whole expression, which any host under 1 ms
+    # would trigger — 0.8 ms publishes an avg of "0.8", stripped to "08".
+    loss10=$(( 10#$loss10 ))
+
+    fmt_cell "$h" "$HOST_W" "" ""
+    ROW="${CELL}  "
+
+    # No probe has completed yet.
+    if (( sent == 0 )); then
+        fmt_cell "WAIT" "$W_STATUS" "$DIM" ""; ROW="${ROW}${CELL}  "
+        fmt_cell "$G_DASH" "$W_LATENCY" "$DIM" ""; ROW="${ROW}${CELL}  "
+        fmt_cell "$G_DASH" "$W_LOSS" "$DIM" ""; ROW="${ROW}${CELL}  "
+        fmt_cell "$G_DASH" "$W_MIN" "$DIM" ""; ROW="${ROW}${CELL}  "
+        fmt_cell "$G_DASH" "$W_AVG" "$DIM" ""; ROW="${ROW}${CELL}  "
+        fmt_cell "$G_DASH" "$W_MAX" "$DIM" ""; ROW="${ROW}${CELL}"
+        return 0
+    fi
+
+    # Status reflects the most recent probe only.
+    if (( ok == 1 )); then
+        fmt_cell "${G_UP} UP" "$W_STATUS" "$GREEN" ""; ROW="${ROW}${CELL}  "
+        fmt_cell "${last} ms" "$W_LATENCY" "" ""; ROW="${ROW}${CELL}  "
+    else
+        fmt_cell "${G_DOWN} DOWN" "$W_STATUS" "$RED" ""; ROW="${ROW}${CELL}  "
+        fmt_cell "$G_DASH" "$W_LATENCY" "$DIM" ""; ROW="${ROW}${CELL}  "
+    fi
+
+    local loss_str=""
+    printf -v loss_str '%d.%d%%' $(( loss10 / 10 )) $(( loss10 % 10 ))
+    calc_trend "$loss10" "${PREV_LOSS10[$idx]}"
+    fmt_cell "$loss_str" "$W_LOSS" "$TREND_COLOR" "$TREND_ARROW"
+    ROW="${ROW}${CELL}  "
+    PREV_LOSS10[$idx]="$loss10"
+
+    # min/max/avg are lifetime statistics — still meaningful while the host
+    # is down, so they keep showing rather than blanking on a dropped packet.
+    local min_txt="$G_DASH" max_txt="$G_DASH" avg_txt="$G_DASH"
+    [[ "$mn" != "-" ]] && min_txt="${mn} ms"
+    [[ "$mx" != "-" ]] && max_txt="${mx} ms"
+    [[ "$avg" != "-" ]] && avg_txt="${avg} ms"
+
+    fmt_cell "$min_txt" "$W_MIN" "" ""; ROW="${ROW}${CELL}  "
+
+    # avg is published with exactly one decimal, so stripping the point
+    # yields tenths — an integer the trend comparison can use directly.
+    TREND_COLOR=""; TREND_ARROW=""
+    local avg10="${avg/./}"
+    if is_uint "$avg10"; then
+        avg10=$(( 10#$avg10 ))
+        calc_trend "$avg10" "${PREV_AVG10[$idx]}"
+        PREV_AVG10[$idx]="$avg10"
+    fi
+    fmt_cell "$avg_txt" "$W_AVG" "$TREND_COLOR" "$TREND_ARROW"; ROW="${ROW}${CELL}  "
+
+    fmt_cell "$max_txt" "$W_MAX" "" ""; ROW="${ROW}${CELL}"
+    return 0
 }
 
 # ── Draw Table ─────────────────────────────────────────────────────
+# Composes the entire frame into one string and writes it with a single
+# printf. Only rows whose rendered text actually changed are addressed and
+# rewritten — the screen is never cleared, so there is no blank gap between
+# erase and redraw, and an idle table costs zero terminal output.
 draw_table() {
-    # Move cursor to top-left corner and clear screen
-    printf '\033[H\033[J'
+    local frame="" pos="" idx
 
-    # Calculate column width for HOST based on longest hostname
-    local hw=4 h
-    for h in "${HOSTS[@]}"; do
-        (( ${#h} > hw )) && hw=${#h}
-    done
-    hw=$((hw + 2))
+    if $NEED_FULL_REDRAW; then
+        compute_layout
+        build_chrome
+        frame="${WRAP_OFF}${CLEAR_SCREEN}${HEADER_BLOCK}"
+        PREV_ROW=()
+    fi
 
-    # Title bar
-    printf '%b' "${BOLD}pingm${RESET} — Live Multi-Ping   ${DIM}[Ctrl+C to stop]${RESET}\n\n"
+    for (( idx = 0; idx < VISIBLE_ROWS; idx++ )); do
+        render_row "$idx" || continue
+        [[ "$ROW" == "${PREV_ROW[$idx]}" ]] && continue
 
-    # Column headers
-    printf '%b' "${BOLD}"
-    printf "%-${hw}s  %-8s  %-12s  %-10s  %-10s  %-12s  %-10s" \
-        "HOST" "STATUS" "LATENCY" "LOSS" "MIN" "AVG" "MAX"
-    printf '%b\n' "${RESET}"
-
-    # Separator line
-    local tw=$((hw + 8 + 12 + 10 + 10 + 12 + 10 + 12))
-    printf '%b' "$DIM"
-    local i
-    for (( i = 0; i < tw; i++ )); do printf '─'; done
-    printf '%b\n' "$RESET"
-
-    # Data rows — one per host
-    for idx in "${!HOSTS[@]}"; do
-        local h="${HOSTS[$idx]}"
-        local df="$WORK_DIR/${h//[\/:]/_}"
-
-        # Host hasn't reported yet
-        if [[ ! -f "$df" ]]; then
-            printf "%-${hw}s  " "$h"
-            printf '%b' "${DIM}WAIT    ${RESET}"
-            printf "  %-12s  %-10s  %-10s  %-12s  %-10s\n" "—" "—" "—" "—" "—"
-            continue
-        fi
-
-        # Read latest stats from worker's data file
-        local sent recv last mn mx sm
-        read -r sent recv last mn mx sm < "$df" 2>/dev/null || continue
-
-        # Calculate packet loss %
-        local loss="—"
-        if (( sent > 0 )); then
-            loss=$(awk -v s="$sent" -v r="$recv" 'BEGIN { printf "%.1f%%", ((s-r)/s)*100 }')
-        fi
-
-        # Calculate running average RTT
-        local avg="—"
-        if (( recv > 0 )); then
-            avg=$(awk -v s="$sm" -v r="$recv" 'BEGIN { printf "%.1f ms", s/r }')
-        fi
-
-        # Trend vs. the previous refresh (lower is always better)
-        local loss_num="${loss%\%}"
-        calc_trend "$loss_num" "${PREV_LOSS[$idx]}"
-        local loss_color="$TREND_COLOR" loss_arrow="$TREND_ARROW"
-
-        # Print host column
-        printf "%-${hw}s  " "$h"
-
-        # Print status + remaining columns
-        # Status is printed separately to handle ANSI color codes without
-        # breaking printf column alignment
-        if [[ "$last" == "-" ]] || (( recv == 0 )); then
-            printf '%b' "${RED}✘ DOWN  ${RESET}"
-            printf "  %-12s  " "—"
-            print_metric "$loss" 10 "$loss_color" "$loss_arrow"
-            printf "  %-10s  %-12s  %-10s\n" "—" "—" "—"
-        else
-            local avg_num="${avg% ms}"
-            calc_trend "$avg_num" "${PREV_AVG[$idx]}"
-            local avg_color="$TREND_COLOR" avg_arrow="$TREND_ARROW"
-
-            printf '%b' "${GREEN}✔ UP    ${RESET}"
-            printf "  %-12s  " "${last} ms"
-            print_metric "$loss" 10 "$loss_color" "$loss_arrow"
-            printf "  %-10s  " "${mn} ms"
-            print_metric "$avg" 12 "$avg_color" "$avg_arrow"
-            printf "  %-10s\n" "${mx} ms"
-
-            PREV_AVG[$idx]="$avg_num"
-        fi
-
-        PREV_LOSS[$idx]="$loss_num"
+        printf -v pos '\033[%d;1H' $(( HEADER_LINES + 1 + idx ))
+        frame="${frame}${pos}${ROW}${CLEAR_EOL}"
+        PREV_ROW[$idx]="$ROW"
     done
 
-    # Footer
-    printf '\n%b' "${DIM}Interval: ${INTERVAL}s"
-    (( COUNT > 0 )) && printf " | Count: %d" "$COUNT"
-    printf '%b\n' "${RESET}"
-    printf '%b\n' "${DIM}Trend vs. last refresh:${RESET} ${GREEN}▼ better${RESET}   ${RED}▲ worse${RESET}"
+    if $NEED_FULL_REDRAW; then
+        printf -v pos '\033[%d;1H' $(( HEADER_LINES + VISIBLE_ROWS + 1 ))
+        frame="${frame}${pos}${FOOTER_BLOCK}"
+        NEED_FULL_REDRAW=false
+    fi
+
+    [[ -z "$frame" ]] && return
+
+    # Park the cursor on the last chrome line so anything printed later
+    # (or the shell prompt on exit) lands below the table.
+    printf -v pos '\033[%d;1H' "$FOOTER_END_LINE"
+    printf '%s' "${frame}${pos}"
 }
 
 # ── Cleanup ────────────────────────────────────────────────────────
 cleanup() {
+    trap - INT TERM EXIT
     if (( ${#PIDS[@]} > 0 )); then
         for pid in "${PIDS[@]}"; do
             kill "$pid" 2>/dev/null || true
         done
         wait 2>/dev/null || true
     fi
-    rm -rf "$WORK_DIR"
+    [[ -n "$WORK_DIR" ]] && rm -rf "$WORK_DIR"
+    printf '%s' "$WRAP_ON"
     tput cnorm 2>/dev/null || true
     printf '\n'
     exit 0
@@ -436,7 +583,7 @@ if (( ${#HOSTS[@]} >= CONFIRM_THRESHOLD )) && ! $ASSUME_YES; then
         echo "Error: About to ping ${#HOSTS[@]} hosts at once — re-run with -y to skip this check (no TTY to confirm)." >&2
         exit 1
     fi
-    printf '%bAbout to ping %d hosts simultaneously. Continue? [y/N] %b' "$BOLD" "${#HOSTS[@]}" "$RESET"
+    printf '%sAbout to ping %d hosts simultaneously. Continue? [y/N] %s' "$BOLD" "${#HOSTS[@]}" "$RESET"
     read -r confirm
     case "$confirm" in
         y|Y|yes|YES) ;;
@@ -444,24 +591,44 @@ if (( ${#HOSTS[@]} >= CONFIRM_THRESHOLD )) && ! $ASSUME_YES; then
     esac
 fi
 
-# Previous LOSS/AVG readings per host (by index), used to draw trend arrows
-PREV_LOSS=()
-PREV_AVG=()
-
-# Create temp working directory for per-host data files
+# Host column width and data file paths are fixed for the whole run, so
+# resolve them once instead of recomputing them on every frame.
+HOST_W=4
+DATA_FILES=()
 WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pingm.XXXXXX")
+for h in "${HOSTS[@]}"; do
+    (( ${#h} > HOST_W )) && HOST_W=${#h}
+done
+HOST_W=$(( HOST_W + 2 ))
+for h in "${HOSTS[@]}"; do
+    DATA_FILES+=("$WORK_DIR/${h//[\/:]/_}")
+done
+
+# Previous LOSS/AVG readings per host (by index), used to draw trend arrows,
+# and the last rendered text per row, used to skip unchanged redraws.
+PREV_LOSS10=()
+PREV_AVG10=()
+PREV_ROW=()
+
+NEED_FULL_REDRAW=true
+STATUS_NOTE=""
+VISIBLE_ROWS=${#HOSTS[@]}
+HIDDEN_ROWS=0
+FOOTER_END_LINE=$(( HEADER_LINES + VISIBLE_ROWS + FOOTER_LINES ))
 TFLAG=$(get_timeout_flag)
 PIDS=()
 
-# Trap signals for clean shutdown
+# Trap signals for clean shutdown; a resize invalidates every cached row
+# position, so force a full repaint on SIGWINCH.
 trap cleanup INT TERM EXIT
+trap 'NEED_FULL_REDRAW=true' WINCH
 
 # Hide cursor for clean table display
 tput civis 2>/dev/null || true
 
 # Launch one background ping worker per host
-for h in "${HOSTS[@]}"; do
-    ping_worker "$h" "$WORK_DIR/${h//[\/:]/_}" "$TFLAG" &
+for idx in "${!HOSTS[@]}"; do
+    ping_worker "${HOSTS[$idx]}" "${DATA_FILES[$idx]}" "$TFLAG" &
     PIDS+=($!)
 done
 
@@ -478,11 +645,11 @@ if (( COUNT > 0 )); then
         done
 
         if $all_done; then
-            # Final redraw with complete data
+            # Final repaint with the completed data and a done notice.
+            STATUS_NOTE="Done — press Ctrl+C to exit"
+            NEED_FULL_REDRAW=true
             draw_table
             tput cnorm 2>/dev/null || true
-            printf '\n%bDone. Press Ctrl+C to exit.%b\n' "$DIM" "$RESET"
-            # Wait for user to dismiss
             while true; do sleep 60; done
         fi
 
