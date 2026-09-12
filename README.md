@@ -13,6 +13,7 @@ Ping multiple hosts simultaneously with a live-updating terminal table.
 - **Hostnames** — `pingm google.com,cloudflare.com`
 - **Mixed** — `pingm google.com,8.8.8.1-8.8.8.4,10.0.0.0/30`
 - **Live table** — color-coded status, latency, packet loss, min/avg/max
+- **Filter by state** — `pingm -f down 10.0.0.0/24` shows only what is broken
 - **Flicker-free** — redraws only the rows that actually changed, in place
 - **Zero dependencies** — pure bash, uses the system `ping` command
 
@@ -64,6 +65,12 @@ pingm -i 2 8.8.8.8,1.1.1.1
 
 # Stop after 5 pings per host
 pingm -c 5 8.8.8.8,1.1.1.1
+
+# Show only the hosts that are not responding
+pingm -f down 10.0.0.0/24
+
+# Show only the hosts that are responding
+pingm -f up 10.0.0.0/24
 ```
 
 ### Options
@@ -72,6 +79,7 @@ pingm -c 5 8.8.8.8,1.1.1.1
 |------|---------|-------------|
 | `-i SECS` | `1` | Interval between pings per host |
 | `-c COUNT` | unlimited | Stop after COUNT pings per host |
+| `-f STATE` | `all` | Only show hosts in STATE: `up`/`online`, `down`/`offline`, or `all` |
 | `-y` | — | Skip the confirmation prompt for large host counts |
 | `-h` | — | Show help |
 | `-v` | — | Show version |
@@ -116,6 +124,32 @@ statistics and remain meaningful while the host is unreachable (see
 `flaky.example` above: currently down, 25% loss, but with real latency history).
 
 - **LOSS** and **AVG** get a trend arrow comparing them to the previous refresh: **▼ green** when the value dropped (better), **▲ red** when it rose (worse). No arrow means unchanged.
+
+### Filtering by state
+
+`-f` changes **what the table displays**, not what gets pinged. Every host is
+still probed on the normal interval, so packet loss and min/avg/max stay
+accurate for hosts that are hidden, and their history is intact the moment
+they reappear.
+
+```bash
+pingm -f down 10.0.0.0/24    # only what is broken
+pingm -f up 10.0.0.0/24      # only what answered — a quick liveness sweep
+```
+
+Rows appear and disappear live as hosts change state: a host that stops
+replying leaves an `-f up` table and joins an `-f down` one on its next
+missed reply. The footer shows the active filter and how many hosts match,
+so a short table is never ambiguous:
+
+```
+Interval: 1s | Filter: down (3 of 254)
+```
+
+`up` and `online` are accepted interchangeably, as are `down` and `offline`.
+When nothing matches, the table says why — `All 254 hosts are responding.`
+for an empty `-f down`, and `Waiting for the first replies…` before every
+host has been probed at least once.
 
 ### Rendering
 

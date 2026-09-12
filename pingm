@@ -10,12 +10,13 @@
 #   pingm google.com,cloudflare.com,8.8.8.1-8.8.8.4
 #
 
-VERSION="1.3.1"
+VERSION="1.4.0"
 MAX_HOSTS=256
 CONFIRM_THRESHOLD=50
 INTERVAL=1
 COUNT=0
 ASSUME_YES=false
+FILTER=all
 
 # ── ANSI ───────────────────────────────────────────────────────────
 RED=$'\033[31m'
@@ -74,9 +75,17 @@ Examples:
 Options:
   -i SECS   Interval between pings per host (default: 1)
   -c COUNT  Stop after COUNT pings per host (default: unlimited)
+  -f STATE  Only show hosts in STATE: up (or online), down (or offline),
+            or all (default). Hosts are still pinged either way — the
+            filter only changes what the table displays, and rows appear
+            and disappear live as hosts change state.
   -y        Skip the confirmation prompt for large host counts
   -h        Show this help message
   -v        Show version
+
+Filter examples:
+  pingm -f down 10.0.0.0/24     only the hosts that are not responding
+  pingm -f up 10.0.0.0/24       only the hosts that are responding
 
 Pinging ${CONFIRM_THRESHOLD}+ hosts at once asks for confirmation first
 (use -y to skip it, e.g. in scripts).
@@ -348,16 +357,17 @@ calc_trend() {
 # addressing only stays correct while the table fits the viewport — one
 # line of overflow scrolls the terminal and every row address drifts — so
 # oversized host lists get clipped with a count of what was hidden.
-compute_layout() {
+read_term_size() {
     # Ask the controlling terminal for its real size. `tput lines` cannot be
     # used here: inside a command substitution its stdout is a pipe, so
     # ncurses has no tty to query and silently returns terminfo's static
     # 24x80 — which would clip the table to 24 lines on a terminal of any
     # size, and report the same 24 again after every resize.
-    local size=""
+    #
     # stderr is redirected first on purpose: if /dev/tty cannot be opened
     # (cron, CI, no controlling terminal) bash reports the failed redirect
     # itself, and only an already-redirected stderr swallows that message.
+    local size=""
     size=$(stty size 2>/dev/null < /dev/tty) || size=""
     TERM_LINES="${size%% *}"
     TERM_COLS="${size##* }"
@@ -371,24 +381,34 @@ compute_layout() {
         TERM_COLS=$(tput cols 2>/dev/null) || TERM_COLS=80
         is_uint "$TERM_COLS" && (( TERM_COLS >= 1 )) || TERM_COLS=80
     fi
+}
 
-    local total=${#HOSTS[@]}
+# Work out how many matching rows fit on screen. Pure arithmetic, so it is
+# safe to run every frame — a filter changes the match count at runtime.
+compute_layout() {
     local avail=$(( TERM_LINES - HEADER_LINES - FOOTER_LINES ))
     (( avail < 1 )) && avail=1
 
-    if (( total <= avail )); then
-        VISIBLE_ROWS=$total
+    if (( MATCH_COUNT == 0 )); then
+        # One line for the "nothing matches" notice instead of host rows.
+        VISIBLE_ROWS=0
         HIDDEN_ROWS=0
+        BODY_LINES=1
+    elif (( MATCH_COUNT <= avail )); then
+        VISIBLE_ROWS=$MATCH_COUNT
+        HIDDEN_ROWS=0
+        BODY_LINES=$MATCH_COUNT
     else
         # One row is surrendered to the "N more" notice.
         VISIBLE_ROWS=$(( avail - 1 ))
         (( VISIBLE_ROWS < 1 )) && VISIBLE_ROWS=1
-        HIDDEN_ROWS=$(( total - VISIBLE_ROWS ))
+        HIDDEN_ROWS=$(( MATCH_COUNT - VISIBLE_ROWS ))
+        BODY_LINES=$VISIBLE_ROWS
     fi
 
     # Where the cursor parks after each frame. Derived here because it
     # depends on the clipped row count, not the raw host count.
-    FOOTER_END_LINE=$(( HEADER_LINES + VISIBLE_ROWS + FOOTER_LINES ))
+    FOOTER_END_LINE=$(( HEADER_LINES + BODY_LINES + FOOTER_LINES ))
     (( HIDDEN_ROWS > 0 )) && FOOTER_END_LINE=$(( FOOTER_END_LINE + 1 ))
 }
 
@@ -420,6 +440,10 @@ build_chrome() {
 
     local settings="Interval: ${INTERVAL}s"
     (( COUNT > 0 )) && settings="${settings} | Count: ${COUNT}"
+    # Say why hosts are missing, so a filtered table never looks broken.
+    if [[ "$FILTER" != "all" ]]; then
+        settings="${settings} | Filter: ${FILTER} (${MATCH_COUNT} of ${#HOSTS[@]})"
+    fi
     [[ -n "$STATUS_NOTE" ]] && settings="${settings} | ${STATUS_NOTE}"
 
     # Must not end in a newline: the footer can sit on the terminal's last
@@ -433,68 +457,83 @@ build_chrome() {
     FOOTER_BLOCK="${FOOTER_BLOCK}${DIM}Trend vs. last refresh:${RESET} ${GREEN}${G_BETTER} better${RESET}   ${RED}${G_WORSE} worse${RESET}${CLEAR_EOL}"
 }
 
-# ── Render One Row ─────────────────────────────────────────────────
-# Produces the full line for host $1 in ROW. Returns 1 if the worker's
-# data file could not be read cleanly, so the caller can leave whatever
-# that row is already showing rather than flashing a broken line.
-render_row() {
-    local idx="$1"
-    local h="${HOSTS[$idx]}" df="${DATA_FILES[$idx]}"
-    local ok sent recv last mn mx avg loss10
+# ── Read One Host ──────────────────────────────────────────────────
+# Loads host $1's published data into the H_* globals and classifies it as
+# up / down / wait. Returns 1 if the worker's file could not be read
+# cleanly, so the caller can keep the values it already had rather than
+# acting on a half-written line.
+read_host() {
+    local df="${DATA_FILES[$1]}"
 
-    ROW=""
     [[ -r "$df" ]] || return 1
-    read -r ok sent recv last mn mx avg loss10 < "$df" 2>/dev/null || return 1
-    is_uint "$sent" && is_uint "$loss10" || return 1
+    read -r H_OK H_SENT H_RECV H_LAST H_MIN H_MAX H_AVG H_LOSS10 < "$df" 2>/dev/null || return 1
+    is_uint "$H_SENT" && is_uint "$H_LOSS10" || return 1
 
     # Force base 10. Bash reads a leading-zero value such as "08" as an octal
     # constant and aborts the whole expression, which any host under 1 ms
     # would trigger — 0.8 ms publishes an avg of "0.8", stripped to "08".
-    loss10=$(( 10#$loss10 ))
+    H_LOSS10=$(( 10#$H_LOSS10 ))
 
-    fmt_cell "$h" "$HOST_W" "" ""
+    if (( H_SENT == 0 )); then
+        H_STATE="wait"
+    elif (( H_OK == 1 )); then
+        H_STATE="up"
+    else
+        H_STATE="down"
+    fi
+    return 0
+}
+
+# ── Format One Row ─────────────────────────────────────────────────
+# Renders the H_* values for host $1 into ROW. Trend arrows compare against
+# that host's own previous reading, so the history arrays stay keyed by host
+# index even though the row may move around on screen.
+format_row() {
+    local idx="$1"
+
+    fmt_cell "${HOSTS[$idx]}" "$HOST_W" "" ""
     ROW="${CELL}  "
 
     # No probe has completed yet.
-    if (( sent == 0 )); then
+    if [[ "$H_STATE" == "wait" ]]; then
         fmt_cell "WAIT" "$W_STATUS" "$DIM" ""; ROW="${ROW}${CELL}  "
         fmt_cell "$G_DASH" "$W_LATENCY" "$DIM" ""; ROW="${ROW}${CELL}  "
         fmt_cell "$G_DASH" "$W_LOSS" "$DIM" ""; ROW="${ROW}${CELL}  "
         fmt_cell "$G_DASH" "$W_MIN" "$DIM" ""; ROW="${ROW}${CELL}  "
         fmt_cell "$G_DASH" "$W_AVG" "$DIM" ""; ROW="${ROW}${CELL}  "
         fmt_cell "$G_DASH" "$W_MAX" "$DIM" ""; ROW="${ROW}${CELL}"
-        return 0
+        return
     fi
 
     # Status reflects the most recent probe only.
-    if (( ok == 1 )); then
+    if [[ "$H_STATE" == "up" ]]; then
         fmt_cell "${G_UP} UP" "$W_STATUS" "$GREEN" ""; ROW="${ROW}${CELL}  "
-        fmt_cell "${last} ms" "$W_LATENCY" "" ""; ROW="${ROW}${CELL}  "
+        fmt_cell "${H_LAST} ms" "$W_LATENCY" "" ""; ROW="${ROW}${CELL}  "
     else
         fmt_cell "${G_DOWN} DOWN" "$W_STATUS" "$RED" ""; ROW="${ROW}${CELL}  "
         fmt_cell "$G_DASH" "$W_LATENCY" "$DIM" ""; ROW="${ROW}${CELL}  "
     fi
 
     local loss_str=""
-    printf -v loss_str '%d.%d%%' $(( loss10 / 10 )) $(( loss10 % 10 ))
-    calc_trend "$loss10" "${PREV_LOSS10[$idx]}"
+    printf -v loss_str '%d.%d%%' $(( H_LOSS10 / 10 )) $(( H_LOSS10 % 10 ))
+    calc_trend "$H_LOSS10" "${PREV_LOSS10[$idx]}"
     fmt_cell "$loss_str" "$W_LOSS" "$TREND_COLOR" "$TREND_ARROW"
     ROW="${ROW}${CELL}  "
-    PREV_LOSS10[$idx]="$loss10"
+    PREV_LOSS10[$idx]="$H_LOSS10"
 
     # min/max/avg are lifetime statistics — still meaningful while the host
     # is down, so they keep showing rather than blanking on a dropped packet.
     local min_txt="$G_DASH" max_txt="$G_DASH" avg_txt="$G_DASH"
-    [[ "$mn" != "-" ]] && min_txt="${mn} ms"
-    [[ "$mx" != "-" ]] && max_txt="${mx} ms"
-    [[ "$avg" != "-" ]] && avg_txt="${avg} ms"
+    [[ "$H_MIN" != "-" ]] && min_txt="${H_MIN} ms"
+    [[ "$H_MAX" != "-" ]] && max_txt="${H_MAX} ms"
+    [[ "$H_AVG" != "-" ]] && avg_txt="${H_AVG} ms"
 
     fmt_cell "$min_txt" "$W_MIN" "" ""; ROW="${ROW}${CELL}  "
 
     # avg is published with exactly one decimal, so stripping the point
     # yields tenths — an integer the trend comparison can use directly.
     TREND_COLOR=""; TREND_ARROW=""
-    local avg10="${avg/./}"
+    local avg10="${H_AVG/./}"
     if is_uint "$avg10"; then
         avg10=$(( 10#$avg10 ))
         calc_trend "$avg10" "${PREV_AVG10[$idx]}"
@@ -503,7 +542,58 @@ render_row() {
     fmt_cell "$avg_txt" "$W_AVG" "$TREND_COLOR" "$TREND_ARROW"; ROW="${ROW}${CELL}  "
 
     fmt_cell "$max_txt" "$W_MAX" "" ""; ROW="${ROW}${CELL}"
-    return 0
+}
+
+# ── Collect Matching Hosts ─────────────────────────────────────────
+# Re-reads every host, caches its rendered row, and builds MATCH — the host
+# indices the current filter admits, in host order. Hosts are formatted even
+# while hidden so their trend history keeps advancing and is correct the
+# moment they reappear.
+refresh_hosts() {
+    local idx
+    MATCH_COUNT=0
+    ALL_PROBED=true
+
+    for (( idx = 0; idx < ${#HOSTS[@]}; idx++ )); do
+        if read_host "$idx"; then
+            format_row "$idx"
+            ROW_CACHE[$idx]="$ROW"
+            STATE_CACHE[$idx]="$H_STATE"
+        fi
+        # A torn read leaves both caches on their previous values, which
+        # keeps the match list stable instead of making rows jump.
+        [[ "${STATE_CACHE[$idx]}" == "wait" ]] && ALL_PROBED=false
+
+        case "$FILTER" in
+            all)  ;;
+            up)   [[ "${STATE_CACHE[$idx]}" == "up"   ]] || continue ;;
+            down) [[ "${STATE_CACHE[$idx]}" == "down" ]] || continue ;;
+        esac
+
+        MATCH[$MATCH_COUNT]="$idx"
+        MATCH_COUNT=$(( MATCH_COUNT + 1 ))
+    done
+}
+
+# What to show when the filter admits nothing. Phrased for the filter in
+# use, because "all hosts are responding" is the useful reading of an empty
+# down-list — but only once something has actually been probed.
+empty_notice() {
+    # Only claim a verdict once every host has one. A fast host replying
+    # while slower ones are still timing out must not read as "all up".
+    if ! $ALL_PROBED; then
+        EMPTY_MSG="Waiting for the first replies…"
+    elif [[ "$FILTER" == "up" ]]; then
+        EMPTY_MSG="No hosts are responding."
+    elif [[ "$FILTER" == "down" ]]; then
+        if (( ${#HOSTS[@]} == 1 )); then
+            EMPTY_MSG="The host is responding."
+        else
+            EMPTY_MSG="All ${#HOSTS[@]} hosts are responding."
+        fi
+    else
+        EMPTY_MSG="No hosts to show."
+    fi
 }
 
 # ── Draw Table ─────────────────────────────────────────────────────
@@ -511,27 +601,54 @@ render_row() {
 # printf. Only rows whose rendered text actually changed are addressed and
 # rewritten — the screen is never cleared, so there is no blank gap between
 # erase and redraw, and an idle table costs zero terminal output.
+#
+# The diff cache is keyed by SCREEN POSITION, not host index: under a filter
+# a host changing state shifts every row beneath it, so position is what
+# actually identifies a line on screen.
 draw_table() {
-    local frame="" pos="" idx
+    local frame="" pos="" slot idx row
+
+    refresh_hosts
+
+    # A changed match count moves the footer and can strand rows below the
+    # new last one, so it needs a full repaint rather than a row diff. With
+    # no filter the count never changes, so the default path never pays for
+    # this.
+    if (( MATCH_COUNT != PREV_MATCH_COUNT )); then
+        NEED_FULL_REDRAW=true
+        PREV_MATCH_COUNT=$MATCH_COUNT
+    fi
 
     if $NEED_FULL_REDRAW; then
+        read_term_size
         compute_layout
         build_chrome
         frame="${WRAP_OFF}${CLEAR_SCREEN}${HEADER_BLOCK}"
-        PREV_ROW=()
+        PREV_LINE=()
     fi
 
-    for (( idx = 0; idx < VISIBLE_ROWS; idx++ )); do
-        render_row "$idx" || continue
-        [[ "$ROW" == "${PREV_ROW[$idx]}" ]] && continue
+    if (( MATCH_COUNT == 0 )); then
+        empty_notice
+        if [[ "$EMPTY_MSG" != "${PREV_LINE[0]}" ]]; then
+            printf -v pos '\033[%d;1H' $(( HEADER_LINES + 1 ))
+            frame="${frame}${pos}${DIM}${EMPTY_MSG}${RESET}${CLEAR_EOL}"
+            PREV_LINE[0]="$EMPTY_MSG"
+        fi
+    else
+        for (( slot = 0; slot < VISIBLE_ROWS; slot++ )); do
+            idx="${MATCH[$slot]}"
+            row="${ROW_CACHE[$idx]}"
+            [[ -z "$row" ]] && continue
+            [[ "$row" == "${PREV_LINE[$slot]}" ]] && continue
 
-        printf -v pos '\033[%d;1H' $(( HEADER_LINES + 1 + idx ))
-        frame="${frame}${pos}${ROW}${CLEAR_EOL}"
-        PREV_ROW[$idx]="$ROW"
-    done
+            printf -v pos '\033[%d;1H' $(( HEADER_LINES + 1 + slot ))
+            frame="${frame}${pos}${row}${CLEAR_EOL}"
+            PREV_LINE[$slot]="$row"
+        done
+    fi
 
     if $NEED_FULL_REDRAW; then
-        printf -v pos '\033[%d;1H' $(( HEADER_LINES + VISIBLE_ROWS + 1 ))
+        printf -v pos '\033[%d;1H' $(( HEADER_LINES + BODY_LINES + 1 ))
         frame="${frame}${pos}${FOOTER_BLOCK}"
         NEED_FULL_REDRAW=false
     fi
@@ -565,10 +682,11 @@ cleanup() {
 # ═══════════════════════════════════════════════════════════════════
 
 # Parse command-line options
-while getopts "i:c:yhv" opt; do
+while getopts "i:c:f:yhv" opt; do
     case $opt in
         i) INTERVAL="$OPTARG" ;;
         c) COUNT="$OPTARG"    ;;
+        f) FILTER="$OPTARG"   ;;
         y) ASSUME_YES=true    ;;
         h) usage ;;
         v) echo "pingm v${VERSION}"; exit 0 ;;
@@ -576,6 +694,23 @@ while getopts "i:c:yhv" opt; do
     esac
 done
 shift $((OPTIND - 1))
+
+# Normalise the filter: trim stray whitespace and fold case, so "-f Down"
+# and a quoting slip like -f" down" land on the intended value rather than
+# on a confusing error.
+FILTER="${FILTER#"${FILTER%%[![:space:]]*}"}"
+FILTER="${FILTER%"${FILTER##*[![:space:]]}"}"
+FILTER=$(printf '%s' "$FILTER" | tr '[:upper:]' '[:lower:]')
+
+case "$FILTER" in
+    up|online)    FILTER=up   ;;
+    down|offline) FILTER=down ;;
+    all|any)      FILTER=all  ;;
+    *)
+        echo "Error: Invalid filter '${FILTER}' (expected up, down, or all)" >&2
+        exit 1
+        ;;
+esac
 
 # Require at least one host argument
 if [[ $# -lt 1 ]]; then
@@ -620,19 +755,35 @@ done
 HOST_W=$(( HOST_W + 2 ))
 for h in "${HOSTS[@]}"; do
     DATA_FILES+=("$WORK_DIR/${h//[\/:]/_}")
+    STATE_CACHE+=("wait")
+    ROW_CACHE+=("")
 done
 
 # Previous LOSS/AVG readings per host (by index), used to draw trend arrows,
 # and the last rendered text per row, used to skip unchanged redraws.
 PREV_LOSS10=()
 PREV_AVG10=()
-PREV_ROW=()
+PREV_LINE=()
+
+# Per-host caches, keyed by host index: the last row rendered for a host and
+# the state the filter matches on. Kept across frames so a torn read leaves
+# the table steady instead of dropping the row out of the match list.
+ROW_CACHE=()
+STATE_CACHE=()
+MATCH=()
+MATCH_COUNT=0
+PREV_MATCH_COUNT=-1
+ALL_PROBED=false
+EMPTY_MSG=""
 
 NEED_FULL_REDRAW=true
 STATUS_NOTE=""
 VISIBLE_ROWS=${#HOSTS[@]}
 HIDDEN_ROWS=0
-FOOTER_END_LINE=$(( HEADER_LINES + VISIBLE_ROWS + FOOTER_LINES ))
+BODY_LINES=${#HOSTS[@]}
+TERM_LINES=24
+TERM_COLS=80
+FOOTER_END_LINE=$(( HEADER_LINES + BODY_LINES + FOOTER_LINES ))
 TFLAG=$(get_timeout_flag)
 PIDS=()
 
