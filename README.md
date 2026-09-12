@@ -1,173 +1,198 @@
 # pingm
 
-Ping multiple hosts simultaneously with a live-updating terminal table.
+A live terminal table of ICMP reachability for many hosts at once.
 
-![demo](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue)
+![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue)
+
+```
+pingm  live multi-host ping
+
+HOST                  STATUS      LATENCY        LOSS           MIN         AVG           MAX
+─────────────────────────────────────────────────────────────────────────────────────────────
+google.com            ✔ UP        5.03 ms        0.0%       5.03 ms     8.60 ms ▼     12.2 ms
+cloudflare.com        ✔ UP        4.31 ms        0.0%       4.31 ms     8.03 ms ▼     11.8 ms
+gateway.lan           ✘ DOWN            —       25.0% ▲     1.02 ms     1.41 ms       2.30 ms
+no-such-host.invalid  ✘ DOWN            —      100.0%             —           —             —
+127.0.0.1             ✔ UP       0.199 ms        0.0%      0.199 ms    0.226 ms ▼    0.254 ms
+
+Interval: 1s
+a all  u up  d down  q quit   ·   ▼ better  ▲ worse
+```
 
 ## Features
 
-- **Comma-separated hosts** — `pingm 8.8.8.8,1.1.1.1`
-- **IP ranges** — `pingm 10.0.0.1-10.0.0.10`
-- **Relative ranges** — `pingm 10.0.0.0+10` (10.0.0.0 through 10.0.0.9)
-- **CIDR subnets** — `pingm 10.0.0.0/24` (also /30, /31, /32, etc.)
-- **Hostnames** — `pingm google.com,cloudflare.com`
-- **Mixed** — `pingm google.com,8.8.8.1-8.8.8.4,10.0.0.0/30`
-- **Live table** — color-coded status, latency, packet loss, min/avg/max
-- **Filter by state** — `pingm -f down 10.0.0.0/24` shows only what is broken
-- **Flicker-free** — redraws only the rows that actually changed, in place
-- **Zero dependencies** — pure bash, uses the system `ping` command
+- **Everything at once** — `pingm 10.0.0.0/24` watches a whole subnet in one table
+- **Honest status** — **✔ UP** / **✘ DOWN** always reflect the *latest* probe, not the host's history
+- **Filter by state** — `-f down` shows only what is broken, or press `d` while it runs
+- **Comma-separated hosts** — `pingm 8.8.8.8,1.1.1.1,router.lan`
+- **IP ranges** — `pingm 10.0.0.1-10.0.0.20`
+- **Relative ranges** — `pingm 10.0.0.0+16`
+- **CIDR subnets** — `pingm 10.0.0.0/24`
+- **No `ping` subprocess** — one ICMP socket for every host, so a /24 costs about as much as a single host
+- **No root needed** on macOS and most Linux (see [Privileges](#privileges))
+- **Single static binary** — nothing to install at runtime
 
 ## Install
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/maxajbarlow/pingm
 cd pingm
 ./install.sh
 ```
 
-Or just copy the script manually:
+Or build it yourself:
 
 ```bash
-cp pingm /usr/local/bin/pingm
-chmod +x /usr/local/bin/pingm
+go build -o pingm . && sudo install -m 0755 pingm /usr/local/bin/pingm
 ```
+
+Requires Go 1.26+ to build (the `golang.org/x/net` and `golang.org/x/term`
+versions in use set that floor). The resulting binary has no runtime
+dependencies.
 
 ## Usage
 
 ```
-pingm [OPTIONS] <hosts>
+pingm [options] <hosts>
 ```
 
 ### Examples
 
 ```bash
-# Ping two IPs
+# A couple of hosts
 pingm 192.168.0.1,192.168.0.40
 
-# Ping an IP range (expands to 10 hosts)
-pingm 10.0.0.1-10.0.0.10
+# An inclusive range
+pingm 10.0.0.1-10.0.0.20
 
-# Ping a relative range: 10.0.0.0 through 10.0.0.9 (10 hosts)
-pingm 10.0.0.0+10
+# 16 consecutive addresses starting at 10.0.0.0
+pingm 10.0.0.0+16
 
-# Ping a whole subnet by CIDR prefix (network through broadcast)
+# A whole subnet, network through broadcast
 pingm 10.0.0.0/24
-pingm 10.0.0.0/30
 
-# Ping hostnames
-pingm google.com,cloudflare.com
-
-# Mix hosts, IPs, and ranges
-pingm google.com,8.8.8.1-8.8.8.4
-
-# Custom interval (2 seconds between pings)
-pingm -i 2 8.8.8.8,1.1.1.1
-
-# Stop after 5 pings per host
-pingm -c 5 8.8.8.8,1.1.1.1
-
-# Show only the hosts that are not responding
+# Only the hosts that are not answering
 pingm -f down 10.0.0.0/24
 
-# Show only the hosts that are responding
-pingm -f up 10.0.0.0/24
+# Four probes a second
+pingm -i 250ms 8.8.8.8,1.1.1.1
+
+# Stop after five probes each
+pingm -c 5 google.com,cloudflare.com
+
+# Mix anything
+pingm google.com,10.0.0.1-10.0.0.4,192.168.1.0/30
 ```
 
 ### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-i SECS` | `1` | Interval between pings per host |
-| `-c COUNT` | unlimited | Stop after COUNT pings per host |
-| `-f STATE` | `all` | Only show hosts in STATE: `up`/`online`, `down`/`offline`, or `all` |
+| `-i DURATION` | `1s` | Interval between probes per host |
+| `-c N` | unlimited | Stop after N probes per host |
+| `-f STATE` | `all` | Show only hosts in STATE: `up`/`online`, `down`/`offline`, or `all` |
+| `-t DURATION` | the interval, capped at 2s | How long to wait for a reply |
 | `-y` | — | Skip the confirmation prompt for large host counts |
-| `-h` | — | Show help |
 | `-v` | — | Show version |
+| `-h` | — | Show help |
 
-### Large host counts
+Durations take a unit: `250ms`, `2s`, `1m`.
 
-Pinging **50+ hosts** at once (e.g. a `/24` or larger `+N` range) asks for
-confirmation first — simultaneously pinging that many devices can look like
-a subnet flood to network monitoring and forks a background worker per host.
-Pass `-y` to skip the prompt, which is required when running non-interactively
-(cron, CI, piped input) since there's no TTY to confirm on.
+### Keys
 
-```bash
-pingm 10.0.0.0/24        # prompts: "About to ping 256 hosts simultaneously. Continue? [y/N]"
-pingm -y 10.0.0.0/24      # skips the prompt
-```
+| Key | Action |
+|-----|--------|
+| `a` | Show all hosts |
+| `u` | Show only hosts that are up |
+| `d` | Show only hosts that are down |
+| `q` | Quit (`Esc` and `Ctrl-C` also work) |
 
-### Output
+## Reading the table
 
-```
-pingm — Live Multi-Ping   [Ctrl+C to stop]
+- **✔ UP** — the most recent probe was answered
+- **✘ DOWN** — the most recent probe went unanswered
+- **WAIT** — no probe has completed yet
 
-HOST              STATUS    LATENCY       LOSS        MIN         AVG           MAX
-───────────────────────────────────────────────────────────────────────────────────────
-192.168.0.1       ✔ UP      12.3 ms       0.0%        10.1 ms     12.3 ms ▼     14.5 ms
-192.168.0.40      ✘ DOWN    —             100.0% ▲     —           —             —
-flaky.example     ✘ DOWN    —             25.0% ▲      16.2 ms     18.7 ms       21.3 ms
-google.com        ✔ UP      18.7 ms       0.0%        16.2 ms     18.7 ms       21.3 ms
+Status always reflects the **latest** probe. A host that answered a hundred
+times and has just missed one is down *right now*, and that is the event the
+tool exists to surface.
 
-Interval: 1s
-Trend vs. last refresh: ▼ better   ▲ worse
-```
+**MIN / AVG / MAX stay on screen while a host is down.** They are lifetime
+figures and remain meaningful when a host is unreachable — see `gateway.lan`
+above: currently down at 25% loss, but with real latency history behind it.
+Only LATENCY, which is a *current* reading, blanks out.
 
-- **✔ UP** (green) — the most recent probe got a reply
-- **✘ DOWN** (red) — the most recent probe timed out
-- **WAIT** (dim) — no probe has completed yet
+**LOSS** is tinted once it is non-zero, so a host that is still nominally up
+but dropping packets stands out — usually the most interesting state on the
+table.
 
-Status always reflects the **latest** probe, not the host's history — a host
-that replied earlier and has since dropped off flips to **✘ DOWN** on its very
-next missed reply. Its MIN/AVG/MAX stay on screen, because those are lifetime
-statistics and remain meaningful while the host is unreachable (see
-`flaky.example` above: currently down, 25% loss, but with real latency history).
+**LOSS** and **AVG** carry a trend arrow comparing them with the previous
+refresh: **▼** when the value fell (better), **▲** when it rose (worse). No
+arrow means unchanged.
 
-- **LOSS** and **AVG** get a trend arrow comparing them to the previous refresh: **▼ green** when the value dropped (better), **▲ red** when it rose (worse). No arrow means unchanged.
+### Filtering
 
-### Filtering by state
+`-f` changes **what is displayed**, never what is probed. Every host keeps
+being probed on the normal interval, so loss and min/avg/max stay accurate
+while a host is hidden and its history is intact the moment it reappears.
 
-`-f` changes **what the table displays**, not what gets pinged. Every host is
-still probed on the normal interval, so packet loss and min/avg/max stay
-accurate for hosts that are hidden, and their history is intact the moment
-they reappear.
-
-```bash
-pingm -f down 10.0.0.0/24    # only what is broken
-pingm -f up 10.0.0.0/24      # only what answered — a quick liveness sweep
-```
-
-Rows appear and disappear live as hosts change state: a host that stops
-replying leaves an `-f up` table and joins an `-f down` one on its next
-missed reply. The footer shows the active filter and how many hosts match,
-so a short table is never ambiguous:
+Rows appear and disappear live as hosts change state, and the footer says how
+many matched so a short table is never ambiguous:
 
 ```
-Interval: 1s | Filter: down (3 of 254)
+Interval: 1s  ·  Filter: down (3 of 254)
 ```
 
-`up` and `online` are accepted interchangeably, as are `down` and `offline`.
 When nothing matches, the table says why — `All 254 hosts are responding.`
-for an empty `-f down`, and `Waiting for the first replies…` before every
-host has been probed at least once.
+for an empty `-f down`, or `Waiting for the first replies…` until every host
+has been probed at least once.
 
-### Rendering
+## Privileges
 
-The table updates in place rather than repainting the screen. Each refresh
-compares every row against what is already displayed and rewrites only the
-lines that changed, as a single write — so there is no clear-then-redraw gap
-and no flicker. All per-row arithmetic happens in the background ping workers,
-which keeps the draw loop free of subprocesses even with hundreds of hosts.
+pingm uses an **unprivileged ICMP datagram socket**, so it does not need root:
 
-If the host list is taller than the terminal, the table is clipped to what fits
-and the footer reports how many rows are hidden; resizing the terminal repaints
-at the new size.
+- **macOS** — works as-is.
+- **Linux** — works wherever `net.ipv4.ping_group_range` covers your user,
+  which is the default on most current distributions. If yours does not:
 
-## Limits
+  ```bash
+  sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+  ```
 
-- Maximum **256 hosts** per invocation (configurable in source via `MAX_HOSTS`) — this includes hosts expanded from a range, `+N`, or CIDR subnet, so `/23` and larger will be rejected
-- Requires `bash` (3.2+, so stock macOS works), `ping`, `awk`, `mktemp` (standard on macOS/Linux)
-- Uses `tput` for terminal size and cursor control when available, and degrades gracefully without it
+If a datagram socket is unavailable, pingm falls back to a raw socket, which
+does require root or `CAP_NET_RAW`.
+
+## Large sweeps
+
+Probing **50 or more hosts** at once asks for confirmation first, because
+lighting up a whole subnet looks like a scan to anything watching the network.
+`-y` skips the prompt, and is required when running without a terminal (cron,
+CI, piped input).
+
+The upper limit is **1024 hosts** per invocation.
+
+## Performance
+
+Probing is one socket and two goroutines for the whole host list, rather than a
+`ping` process per host per interval. Measured on an M-series Mac, 12-second
+runs, CPU for the entire process tree:
+
+| Hosts | v1 (shell) | v2 (Go) |
+|-------|-----------|---------|
+| 10 | 5.6% of a core | 1.0% |
+| 40 | 18.3% | 0.8% |
+| 100 | 37.5% | 1.5% |
+| 254 (a /24) | — | 1.5% |
+
+Cost in v2 is effectively flat in the host count; in v1 it grew linearly and a
+/24 would have saturated a core.
+
+## History
+
+v1 was a single bash script. It is kept at
+[`legacy/pingm.sh`](legacy/pingm.sh) for reference. v2 is a rewrite in Go —
+the shell version could not open a socket, so it forked a `ping` process per
+host per interval and did its arithmetic in `awk`.
 
 ## License
 
