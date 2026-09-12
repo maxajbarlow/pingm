@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -66,13 +67,19 @@ func (p *Prober) destination(ip net.IP) net.Addr {
 // processes a second across a /24. One socket and two goroutines replace all
 // of it, which is the main reason this tool is no longer a shell script.
 type Prober struct {
-	conn     *icmp.PacketConn
-	raw      bool // true when using raw sockets (privileged) rather than datagram
-	id       int
-	targets  []Target
-	interval time.Duration
-	timeout  time.Duration
-	results  chan Result
+	conn    *icmp.PacketConn
+	raw     bool // true when using raw sockets (privileged) rather than datagram
+	id      int
+	targets []Target
+	results chan Result
+
+	// Both are adjustable while probing is under way, so they are held as
+	// atomics rather than under the mutex: the sender reads the interval and
+	// the sweeper reads the timeout, and neither should have to contend with
+	// the receive path for them.
+	interval atomic.Int64 // nanoseconds
+	timeout  atomic.Int64 // nanoseconds
+	reset    chan struct{}
 
 	// mu guards inflight, which the sender, receiver and sweeper all touch.
 	// seq and counts are only ever written by the sender, but are kept under
@@ -99,17 +106,47 @@ func NewProber(targets []Target, interval, timeout time.Duration) (*Prober, erro
 	if err != nil {
 		return nil, err
 	}
-	return &Prober{
+	p := &Prober{
 		conn:     conn,
 		raw:      raw,
 		id:       os.Getpid() & 0xffff,
 		targets:  targets,
-		interval: interval,
-		timeout:  timeout,
 		results:  make(chan Result, len(targets)*4),
+		reset:    make(chan struct{}, 1),
 		inflight: make(map[uint16]probe, len(targets)*4),
 		counts:   make([]int, len(targets)),
-	}, nil
+	}
+	p.interval.Store(int64(interval))
+	p.timeout.Store(int64(timeout))
+	return p, nil
+}
+
+// Interval is the current gap between probes for a given host.
+func (p *Prober) Interval() time.Duration { return time.Duration(p.interval.Load()) }
+
+// SetInterval changes the probe cadence while running. The change takes
+// effect immediately: a wait already under way is cut short rather than
+// running out at the old interval, so speeding up feels instant.
+func (p *Prober) SetInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	p.interval.Store(int64(d))
+	select {
+	case p.reset <- struct{}{}:
+	default: // A reset is already pending; one is enough.
+	}
+}
+
+// Timeout is how long a probe may go unanswered before it counts as lost.
+func (p *Prober) Timeout() time.Duration { return time.Duration(p.timeout.Load()) }
+
+// SetTimeout changes the reply deadline while running. The sweeper reads it
+// afresh each tick, so no wake-up is needed.
+func (p *Prober) SetTimeout(d time.Duration) {
+	if d > 0 {
+		p.timeout.Store(int64(d))
+	}
 }
 
 func listen() (*icmp.PacketConn, bool, error) {
@@ -153,9 +190,6 @@ func (p *Prober) Run(ctx context.Context, limit int) {
 	go func() { defer wg.Done(); p.receive(ctx) }()
 	go func() { defer wg.Done(); p.sweep(ctx) }()
 
-	ticker := time.NewTicker(p.interval)
-	defer ticker.Stop()
-
 loop:
 	for rounds := 0; ; {
 		p.sendRound()
@@ -166,10 +200,8 @@ loop:
 			p.drain(ctx)
 			break loop
 		}
-		select {
-		case <-ctx.Done():
+		if !p.waitForNextRound(ctx) {
 			break loop
-		case <-ticker.C:
 		}
 	}
 
@@ -183,10 +215,29 @@ loop:
 	p.expireAll()
 }
 
+// waitForNextRound sleeps until the next round is due, returning false if the
+// run was cancelled. A timer is built per wait rather than a long-lived
+// ticker so that a change of interval is picked up at once: SetInterval wakes
+// the wait, and it restarts against the new value.
+func (p *Prober) waitForNextRound(ctx context.Context) bool {
+	for {
+		timer := time.NewTimer(p.Interval())
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+			return true
+		case <-p.reset:
+			timer.Stop() // The interval changed; wait again on the new one.
+		}
+	}
+}
+
 // drain waits out the final round so the last probes are reported rather than
 // being discarded when the socket closes.
 func (p *Prober) drain(ctx context.Context) {
-	deadline := time.NewTimer(p.timeout + sweepInterval)
+	deadline := time.NewTimer(p.Timeout() + sweepInterval)
 	defer deadline.Stop()
 	select {
 	case <-ctx.Done():
@@ -355,7 +406,7 @@ func (p *Prober) expire(now time.Time) {
 
 	p.mu.Lock()
 	for seq, pending := range p.inflight {
-		if now.Sub(pending.sentAt) >= p.timeout {
+		if now.Sub(pending.sentAt) >= p.Timeout() {
 			delete(p.inflight, seq)
 			lost = append(lost, Result{Index: pending.target, Probe: pending.number, OK: false})
 		}
