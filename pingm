@@ -10,7 +10,7 @@
 #   pingm google.com,cloudflare.com,8.8.8.1-8.8.8.4
 #
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 MAX_HOSTS=256
 CONFIRM_THRESHOLD=50
 INTERVAL=1
@@ -349,10 +349,28 @@ calc_trend() {
 # line of overflow scrolls the terminal and every row address drifts — so
 # oversized host lists get clipped with a count of what was hidden.
 compute_layout() {
-    TERM_LINES=$(tput lines 2>/dev/null) || TERM_LINES=24
-    TERM_COLS=$(tput cols 2>/dev/null) || TERM_COLS=80
-    is_uint "$TERM_LINES" || TERM_LINES=24
-    is_uint "$TERM_COLS"  || TERM_COLS=80
+    # Ask the controlling terminal for its real size. `tput lines` cannot be
+    # used here: inside a command substitution its stdout is a pipe, so
+    # ncurses has no tty to query and silently returns terminfo's static
+    # 24x80 — which would clip the table to 24 lines on a terminal of any
+    # size, and report the same 24 again after every resize.
+    local size=""
+    # stderr is redirected first on purpose: if /dev/tty cannot be opened
+    # (cron, CI, no controlling terminal) bash reports the failed redirect
+    # itself, and only an already-redirected stderr swallows that message.
+    size=$(stty size 2>/dev/null < /dev/tty) || size=""
+    TERM_LINES="${size%% *}"
+    TERM_COLS="${size##* }"
+
+    # Fall back only when there is no controlling terminal to ask.
+    if ! is_uint "$TERM_LINES" || (( TERM_LINES < 1 )); then
+        TERM_LINES=$(tput lines 2>/dev/null) || TERM_LINES=24
+        is_uint "$TERM_LINES" && (( TERM_LINES >= 1 )) || TERM_LINES=24
+    fi
+    if ! is_uint "$TERM_COLS" || (( TERM_COLS < 1 )); then
+        TERM_COLS=$(tput cols 2>/dev/null) || TERM_COLS=80
+        is_uint "$TERM_COLS" && (( TERM_COLS >= 1 )) || TERM_COLS=80
+    fi
 
     local total=${#HOSTS[@]}
     local avail=$(( TERM_LINES - HEADER_LINES - FOOTER_LINES ))
