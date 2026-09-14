@@ -312,6 +312,18 @@ CI, piped input).
 
 The upper limit is **1024 hosts** per invocation.
 
+A round's probes are **spread across the interval** rather than sent in one
+burst. Replies come back on the same shape as the sends, and several hundred
+arriving at once overrun the socket's receive queue — 8KB on macOS for this
+socket type, roughly thirty packets — after which the kernel drops the rest
+silently. Nothing errors; the probes simply go unanswered and the table calls
+live hosts down. Pacing the sends paces the replies, and the receive buffer is
+sized to the host count on top of that. It also makes a large sweep markedly
+less like a port scan.
+
+Each host is still probed once per interval; only the offsets within the
+interval differ.
+
 ## Performance
 
 Probing is one socket and two goroutines for the whole host list, rather than a

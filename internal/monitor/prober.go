@@ -20,6 +20,30 @@ import (
 // spinning.
 const sweepInterval = 50 * time.Millisecond
 
+// A round's probes are spread across the interval rather than sent in one
+// burst, because replies come back on the same shape as the sends.
+//
+// Several hundred replies arriving at once overrun the socket's receive queue
+// — 8KB on macOS for this socket type, which is roughly thirty packets — and
+// the kernel silently drops the rest. Nothing reports an error: the probes
+// simply go unanswered and the table calls live hosts down. Measured against
+// 1.1.1.0/24, a burst had the kernel take 9,728 replies while this process
+// managed to read only 4,295 of them.
+//
+// Pacing also makes a large sweep markedly less like a port scan, which the
+// tool already warns about.
+const (
+	// pacingBudget is the share of the interval a round may spend sending.
+	// The remainder is headroom, so a round still finishes before the next
+	// one is due even if a send blocks briefly.
+	pacingBudget = 0.8
+
+	// maxSendGap stops a short host list being dribbled out across a long
+	// interval. Two hosts at -i 10s have no burst worth spreading, and
+	// probing them seconds apart would only make the table confusing.
+	maxSendGap = 2 * time.Millisecond
+)
+
 // magic tags our echo requests, and the two identifiers after it let a reply
 // be matched even if the 16-bit wire sequence number has wrapped and been
 // handed out again.
@@ -67,7 +91,7 @@ func (p *Prober) destination(ip net.IP) net.Addr {
 // processes a second across a /24. One socket and two goroutines replace all
 // of it, which is the main reason this tool is no longer a shell script.
 type Prober struct {
-	conn    *icmp.PacketConn
+	conn    net.PacketConn
 	raw     bool // true when using raw sockets (privileged) rather than datagram
 	id      int
 	targets []Target
@@ -84,6 +108,10 @@ type Prober struct {
 	// mu guards inflight, which the sender, receiver and sweeper all touch.
 	// seq and counts are only ever written by the sender, but are kept under
 	// the same lock rather than reasoning about two regimes.
+	// TEMPORARY instrumentation.
+	nRead, nEchoReply, nOurs, nMatched, nStale, nSendErr, nCollide atomic.Int64
+	nBlocked, nBlockedNs                                           atomic.Int64
+
 	mu       sync.Mutex
 	seq      uint16
 	inflight map[uint16]probe
@@ -102,7 +130,7 @@ type probe struct {
 // Linux where net.ipv4.ping_group_range permits it, and falls back to a raw
 // socket (which does require root) only if that is unavailable.
 func NewProber(targets []Target, interval, timeout time.Duration) (*Prober, error) {
-	conn, raw, err := listen()
+	conn, raw, err := listen(len(targets))
 	if err != nil {
 		return nil, err
 	}
@@ -149,14 +177,46 @@ func (p *Prober) SetTimeout(d time.Duration) {
 	}
 }
 
-func listen() (*icmp.PacketConn, bool, error) {
+// receiveBuffer sizes the socket's receive queue to hold a burst of replies.
+//
+// Socket buffers are charged per packet rather than per byte, and the charge
+// is far more than an echo reply's 20-odd bytes, so this budgets generously:
+// enough for several rounds in flight at once, which is what a slow redraw or
+// a GC pause needs to be survivable. The kernel clamps it to kern.ipc.maxsockbuf
+// anyway, so asking for too much costs nothing.
+func receiveBuffer(targets int) int {
+	const (
+		perPacket = 256
+		rounds    = 8
+		floor     = 256 << 10 // 256KB
+		ceiling   = 4 << 20   // 4MB
+	)
+	want := targets * rounds * perPacket
+	if want < floor {
+		return floor
+	}
+	if want > ceiling {
+		return ceiling
+	}
+	return want
+}
+
+// listen opens the ICMP socket, preferring the unprivileged datagram form.
+func listen(targets int) (net.PacketConn, bool, error) {
+	if conn, err := listenDatagram(targets); err == nil {
+		return conn, false, nil
+	}
+	// The library's own listener as a fallback: it cannot be given a receive
+	// buffer up front, so raise it afterwards where the platform allows.
 	if conn, err := icmp.ListenPacket("udp4", "0.0.0.0"); err == nil {
+		tune(conn, targets)
 		return conn, false, nil
 	}
 	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
 		return nil, false, fmt.Errorf("cannot open an ICMP socket (try running as root): %w", err)
 	}
+	tune(conn, targets)
 	return conn, true, nil
 }
 
@@ -192,7 +252,10 @@ func (p *Prober) Run(ctx context.Context, limit int) {
 
 loop:
 	for rounds := 0; ; {
-		p.sendRound()
+		started := time.Now()
+		if !p.sendRound(ctx) {
+			break loop
+		}
 		rounds++
 
 		if limit > 0 && rounds >= limit {
@@ -200,7 +263,7 @@ loop:
 			p.drain(ctx)
 			break loop
 		}
-		if !p.waitForNextRound(ctx) {
+		if !p.waitForNextRound(ctx, started) {
 			break loop
 		}
 	}
@@ -216,12 +279,20 @@ loop:
 }
 
 // waitForNextRound sleeps until the next round is due, returning false if the
-// run was cancelled. A timer is built per wait rather than a long-lived
-// ticker so that a change of interval is picked up at once: SetInterval wakes
-// the wait, and it restarts against the new value.
-func (p *Prober) waitForNextRound(ctx context.Context) bool {
+// run was cancelled.
+//
+// The wait is measured from when the last round *started*, not from when it
+// finished, so the time spent pacing sends comes out of the interval rather
+// than being added on top of it. A timer is built per wait rather than a
+// long-lived ticker so that a change of interval is picked up at once:
+// SetInterval wakes the wait, and it restarts against the new value.
+func (p *Prober) waitForNextRound(ctx context.Context, started time.Time) bool {
 	for {
-		timer := time.NewTimer(p.Interval())
+		remaining := p.Interval() - time.Since(started)
+		if remaining <= 0 {
+			return true // The round used the whole interval; the next is due.
+		}
+		timer := time.NewTimer(remaining)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -229,7 +300,7 @@ func (p *Prober) waitForNextRound(ctx context.Context) bool {
 		case <-timer.C:
 			return true
 		case <-p.reset:
-			timer.Stop() // The interval changed; wait again on the new one.
+			timer.Stop() // The interval changed; measure against the new one.
 		}
 	}
 }
@@ -245,10 +316,47 @@ func (p *Prober) drain(ctx context.Context) {
 	}
 }
 
-func (p *Prober) sendRound() {
+// sendRound sends one probe to every target, spread across the interval so the
+// replies arrive as a stream rather than a wall. It returns false if the run
+// was cancelled part way through.
+func (p *Prober) sendRound(ctx context.Context) bool {
+	gap := p.sendGap()
+	if gap <= 0 {
+		for i := range p.targets {
+			p.send(i)
+		}
+		return ctx.Err() == nil
+	}
+
+	ticker := time.NewTicker(gap)
+	defer ticker.Stop()
+
 	for i := range p.targets {
 		p.send(i)
+		if i == len(p.targets)-1 {
+			break // Nothing left to wait for.
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
 	}
+	return true
+}
+
+// sendGap is how long to wait between one probe and the next. Zero means send
+// the round in one go, which is right when there is no burst worth spreading.
+func (p *Prober) sendGap() time.Duration {
+	n := len(p.targets)
+	if n < 2 {
+		return 0
+	}
+	gap := time.Duration(float64(p.Interval()) * pacingBudget / float64(n))
+	if gap > maxSendGap {
+		return maxSendGap
+	}
+	return gap
 }
 
 func (p *Prober) send(index int) {

@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	version = "2.1.0"
+	version = "2.1.1"
 
 	// maxHosts is far above the shell version's 256 because probing no longer
 	// costs a process per host — the whole list shares one socket.
