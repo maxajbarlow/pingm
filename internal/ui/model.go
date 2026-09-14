@@ -3,10 +3,13 @@ package ui
 import (
 	"fmt"
 	"math"
+	"os"
+	"sort"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/maxajbarlow/pingm/internal/monitor"
 )
 
@@ -45,12 +48,15 @@ func ParseFilter(s string) (Filter, error) {
 	}
 }
 
+// admits decides whether a host belongs in the current view. A name that never
+// resolved counts as down: the filter means "show me what is not answering",
+// and an unresolved host is certainly not answering.
 func (f Filter) admits(v monitor.HostView) bool {
 	switch f {
 	case FilterUp:
 		return v.State == monitor.StateUp
 	case FilterDown:
-		return v.State == monitor.StateDown
+		return v.State == monitor.StateDown || v.State == monitor.StateUnresolved
 	default:
 		return true
 	}
@@ -67,21 +73,26 @@ type tickMsg time.Time
 type frameMsg time.Time
 type finishedMsg struct{}
 
-// How long a newly-alive row stays highlighted, and how often the screen is
+// How long a newly-changed row stays highlighted, and how often the screen is
 // repainted while one is. The frame ticker runs only while something is
 // actually animating, so an idle table still costs nothing to display.
 const (
 	flashDuration = 1300 * time.Millisecond
 	frameInterval = 90 * time.Millisecond
+
+	// wheelLines is how far one notch of the mouse wheel moves the table.
+	// Three matches what terminals and pagers do by default.
+	wheelLines = 3
 )
 
 // Controller is the part of the monitor the table needs: a consistent
-// snapshot to draw, and the ability to retune the probe cadence. An interface
-// rather than *monitor.Monitor so the model can be exercised without opening
-// a socket.
+// snapshot to draw, the ability to retune the probe cadence, and whether the
+// socket needed privileges. An interface rather than *monitor.Monitor so the
+// model can be exercised without opening a socket.
 type Controller interface {
 	Snapshot() []monitor.HostView
 	SetInterval(time.Duration)
+	Privileged() bool
 }
 
 // intervalLadder is what the +/- keys step through: a 1-2-5 sequence spanning
@@ -149,21 +160,38 @@ type Model struct {
 	width, height int
 	views         []monitor.HostView
 
+	// offset is the first matching row on screen. Held rather than derived so
+	// the view stays put as hosts change state underneath it.
+	offset int
+
 	// Previous readings per host, for trend arrows. Indexed by host, so a row
 	// moving around under a filter keeps its own history.
 	prevLoss []float64
 	prevAvg  []float64
 	hasPrev  []bool
 
-	// aliveAt records when each host most recently came up, which drives the
-	// highlight. Indexed by host, so the marker follows the host even as a
-	// filter moves its row around.
-	aliveAt   []time.Time
+	// flashAt records when each host most recently changed state and which
+	// way it went, which drives the highlight. Indexed by host, so the marker
+	// follows the host even as a filter moves its row around.
+	flashAt   []time.Time
+	flashDown []bool
 	animating bool
+
+	// downSince is when each host stopped answering, and outlives the flash:
+	// it is what the table reads out in place of a latency the host cannot
+	// supply. Zero means the host is up, or has never been seen down.
+	downSince []time.Time
 
 	// now is injected so the animation can be tested without sleeping.
 	now func() time.Time
 
+	// bell rings the terminal when a host changes state, if the user has
+	// asked for it. Injected so tests need not make noise.
+	bell    func()
+	belling bool
+
+	paused   bool
+	showHelp bool
 	done     bool
 	quitting bool
 }
@@ -174,22 +202,30 @@ func NewModel(mon Controller, filter Filter, interval time.Duration, limit int, 
 	views := mon.Snapshot()
 
 	return Model{
-		mon:      mon,
-		finished: finished,
-		filter:   filter,
-		interval: interval,
-		limit:    limit,
-		refresh:  refreshFor(interval),
-		views:    views,
-		prevLoss: make([]float64, len(views)),
-		prevAvg:  make([]float64, len(views)),
-		hasPrev:  make([]bool, len(views)),
-		aliveAt:  make([]time.Time, len(views)),
-		now:      time.Now,
-		width:    80,
-		height:   24,
+		mon:       mon,
+		finished:  finished,
+		filter:    filter,
+		interval:  interval,
+		limit:     limit,
+		refresh:   refreshFor(interval),
+		views:     views,
+		prevLoss:  make([]float64, len(views)),
+		prevAvg:   make([]float64, len(views)),
+		hasPrev:   make([]bool, len(views)),
+		flashAt:   make([]time.Time, len(views)),
+		flashDown: make([]bool, len(views)),
+		downSince: make([]time.Time, len(views)),
+		now:       time.Now,
+		bell:      ringBell,
+		width:     defaultWidth,
+		height:    24,
 	}
 }
+
+// ringBell writes BEL to the terminal. It goes to stderr rather than through
+// the renderer because BEL moves no cursor and paints nothing, so it cannot
+// disturb the frame the renderer is drawing.
+func ringBell() { fmt.Fprint(os.Stderr, "\a") }
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(m.tick(), m.waitForFinish())
@@ -217,26 +253,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.clampOffset()
 		return m, nil
 
+	case tea.MouseMsg:
+		return m.handleMouse(msg), nil
+
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "q", "esc", "ctrl+c":
-			m.quitting = true
-			return m, tea.Quit
-		case "a":
-			m.filter = FilterAll
-		case "u":
-			m.filter = FilterUp
-		case "d":
-			m.filter = FilterDown
-		case "+", "=":
-			// "=" is the unshifted key, so + works without reaching for shift.
-			m.setInterval(slower(m.interval))
-		case "-", "_":
-			m.setInterval(faster(m.interval))
-		}
-		return m, nil
+		return m.handleKey(msg)
 
 	case finishedMsg:
 		m.done = true
@@ -244,7 +268,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
-		m.refreshViews()
+		// A paused table keeps probing and keeps collecting; it simply stops
+		// taking new snapshots, so the numbers on screen hold still while the
+		// statistics underneath stay honest.
+		if !m.paused {
+			m.refreshViews()
+		}
 		// Starting a highlight turns the frame ticker on; it switches itself
 		// off again once every highlight has faded.
 		if m.anyFlashing() && !m.animating {
@@ -263,51 +292,212 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handleMouse maps the wheel onto the table. Only wheel events are consumed:
+// clicks and drags are left alone so a stray click cannot move the view.
+func (m Model) handleMouse(msg tea.MouseMsg) Model {
+	if msg.Action != tea.MouseActionPress {
+		return m
+	}
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		m.scroll(-wheelLines)
+	case tea.MouseButtonWheelDown:
+		m.scroll(wheelLines)
+	}
+	return m
+}
+
+func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+
+	// Help is modal: while it is up, any key dismisses it rather than doing
+	// its usual job, so there is no way to act on a table you cannot see.
+	if m.showHelp {
+		if key == "ctrl+c" {
+			m.quitting = true
+			return m, tea.Quit
+		}
+		m.showHelp = false
+		return m, nil
+	}
+
+	switch key {
+	case "q", "esc", "ctrl+c":
+		m.quitting = true
+		return m, tea.Quit
+	case "?":
+		m.showHelp = true
+	case "a":
+		m.filter = FilterAll
+		m.clampOffset()
+	case "u":
+		m.filter = FilterUp
+		m.clampOffset()
+	case "d":
+		m.filter = FilterDown
+		m.clampOffset()
+	case "p":
+		m.paused = !m.paused
+	case "b":
+		m.belling = !m.belling
+	case "+", "=":
+		// "=" is the unshifted key, so + works without reaching for shift.
+		m.setInterval(slower(m.interval))
+	case "-", "_":
+		m.setInterval(faster(m.interval))
+	case "up", "k":
+		m.scroll(-1)
+	case "down", "j":
+		m.scroll(1)
+	case "pgup", "b-page":
+		m.scroll(-m.rowBudget())
+	case "pgdown", " ":
+		m.scroll(m.rowBudget())
+	case "home", "g":
+		m.offset = 0
+	case "end", "G":
+		m.offset = m.maxOffset()
+	}
+	return m, nil
+}
+
+// scroll moves the view by delta rows, stopping at either end.
+func (m *Model) scroll(delta int) {
+	m.offset += delta
+	m.clampOffset()
+}
+
+// rowBudget is how many host rows fit between the header and the footer.
+func (m Model) rowBudget() int {
+	budget := m.height - headerLines - footerLines
+	if budget < 1 {
+		return 1
+	}
+	return budget
+}
+
+// maxOffset is the furthest the table can scroll: far enough to bring the last
+// row into view, and no further, so the bottom of the list never floats up
+// into empty space.
+func (m Model) maxOffset() int {
+	// One row goes to the scroll indicator whenever there is anything to
+	// scroll, which is exactly when this matters.
+	visible := m.rowBudget() - 1
+	if visible < 1 {
+		visible = 1
+	}
+	over := len(m.matching()) - visible
+	if over < 0 {
+		return 0
+	}
+	return over
+}
+
+func (m *Model) clampOffset() {
+	if max := m.maxOffset(); m.offset > max {
+		m.offset = max
+	}
+	if m.offset < 0 {
+		m.offset = 0
+	}
+}
+
 // refreshViews takes a fresh snapshot, first rolling the readings it is about
 // to replace into the trend baseline. A host still waiting has no baseline
 // worth comparing against, so it gets no arrow on its first real reading.
 func (m *Model) refreshViews() {
 	next := m.mon.Snapshot()
+	rang := false
 
 	for i := range m.views {
-		// A host that was not up and now is has just come alive — whether
-		// that is a recovery or its very first reply.
-		if i < len(next) && m.views[i].State != monitor.StateUp && next[i].State == monitor.StateUp {
-			m.aliveAt[i] = m.now()
+		if i < len(next) {
+			rang = m.noteTransition(i, m.views[i].State, next[i].State) || rang
 		}
 		m.prevLoss[i] = m.views[i].Loss
 		m.prevAvg[i] = float64(m.views[i].Avg)
 		m.hasPrev[i] = m.views[i].State != monitor.StateWaiting
 	}
 	m.views = next
+
+	if rang && m.belling && m.bell != nil {
+		m.bell()
+	}
+	m.clampOffset()
+}
+
+// noteTransition records a change of state for host i and reports whether it
+// is worth ringing the bell for.
+//
+// A host coming alive always flashes, first reply included, because that is
+// news either way. A host dropping out flashes only if it was up beforehand:
+// on `pingm 10.0.0.0/24` most addresses are dead from the start, and lighting
+// all of them red at once would say nothing and drown out the one that
+// matters. The bell is stricter still and stays silent on first readings, so
+// starting the tool never sets off a fanfare.
+func (m *Model) noteTransition(i int, prev, next monitor.State) bool {
+	switch {
+	case prev != monitor.StateUp && next == monitor.StateUp:
+		m.flashAt[i] = m.now()
+		m.flashDown[i] = false
+		m.downSince[i] = time.Time{}
+		return prev != monitor.StateWaiting
+
+	case prev == monitor.StateUp && next != monitor.StateUp:
+		m.flashAt[i] = m.now()
+		m.flashDown[i] = true
+		m.downSince[i] = m.now()
+		return true
+
+	case prev == monitor.StateWaiting && next != monitor.StateWaiting:
+		// Down from the very first probe: worth timing, not worth announcing.
+		m.downSince[i] = m.now()
+		return false
+	}
+	return false
 }
 
 // flash is how strongly host i is highlighted right now, counting down from
-// FlashMax at the moment it came alive to FlashNone once flashDuration has
+// FlashMax at the moment it changed state to zero once flashDuration has
 // elapsed.
 func (m Model) flash(i int) Flash {
-	if i >= len(m.aliveAt) || m.aliveAt[i].IsZero() {
-		return FlashNone
+	if i >= len(m.flashAt) || m.flashAt[i].IsZero() {
+		return Flash{}
 	}
-	elapsed := m.now().Sub(m.aliveAt[i])
+	elapsed := m.now().Sub(m.flashAt[i])
 	if elapsed < 0 || elapsed >= flashDuration {
-		return FlashNone
+		return Flash{}
 	}
 	remaining := float64(flashDuration-elapsed) / float64(flashDuration)
-	level := Flash(math.Ceil(remaining * float64(FlashMax)))
+	level := int(math.Ceil(remaining * float64(FlashMax)))
 	if level > FlashMax {
 		level = FlashMax
 	}
-	return level
+	return Flash{Level: level, Down: m.flashDown[i]}
 }
 
 func (m Model) anyFlashing() bool {
-	for i := range m.aliveAt {
-		if m.flash(i) > FlashNone {
+	for i := range m.flashAt {
+		if m.flash(i).Active() {
 			return true
 		}
 	}
 	return false
+}
+
+// downFor is how long host i has been unreachable, or false if it is up or has
+// never been seen to fall over.
+func (m Model) downFor(i int) (time.Duration, bool) {
+	if i >= len(m.downSince) || m.downSince[i].IsZero() {
+		return 0, false
+	}
+	if m.views[i].State == monitor.StateUp {
+		return 0, false
+	}
+	d := m.now().Sub(m.downSince[i])
+	if d < 0 {
+		return 0, false
+	}
+	return d, true
 }
 
 // setInterval retunes probing and redrawing together. A no-op change is
@@ -335,8 +525,11 @@ func (m Model) View() string {
 	if m.quitting {
 		return ""
 	}
+	if m.showHelp {
+		return m.helpView()
+	}
 
-	cols := NewColumns(m.views)
+	cols := NewColumns(m.views, m.width)
 	matched := m.matching()
 
 	var b strings.Builder
@@ -346,34 +539,72 @@ func (m Model) View() string {
 	b.WriteString(Header(cols))
 	b.WriteString("\n")
 
-	budget := m.height - headerLines - footerLines
-	if budget < 1 {
-		budget = 1
-	}
+	budget := m.rowBudget()
 
-	if len(matched) == 0 {
+	switch {
+	case len(matched) == 0:
 		b.WriteString(styleMuted.Render(m.emptyNotice()))
 		b.WriteString("\n")
-	} else {
-		shown, hidden := matched, 0
-		if len(shown) > budget {
-			shown, hidden = shown[:budget-1], len(shown)-(budget-1)
-		}
-		for _, i := range shown {
-			b.WriteString(Row(m.views[i], cols, m.lossTrend(i), m.avgTrend(i), m.flash(i)))
+
+	case len(matched) <= budget:
+		for _, i := range matched {
+			b.WriteString(m.renderRow(i, cols))
 			b.WriteString("\n")
 		}
-		if hidden > 0 {
-			b.WriteString(styleMuted.Render(fmt.Sprintf("… %d more hidden — resize the terminal to show them", hidden)))
+
+	default:
+		// One row is given over to the scroll indicator, which is only ever
+		// drawn when there is something off screen to point at.
+		visible := budget - 1
+		start := m.offset
+		if max := len(matched) - visible; start > max {
+			start = max
+		}
+		if start < 0 {
+			start = 0
+		}
+		end := start + visible
+		if end > len(matched) {
+			end = len(matched)
+		}
+		for _, i := range matched[start:end] {
+			b.WriteString(m.renderRow(i, cols))
 			b.WriteString("\n")
 		}
+		b.WriteString(styleMuted.Render(scrollNotice(start, len(matched)-end)))
+		b.WriteString("\n")
 	}
 
 	b.WriteString("\n")
-	b.WriteString(styleFooter.Render(m.statusLine(len(matched))))
+	b.WriteString(styleFooter.Render(truncate(m.statusLine(len(matched)), m.width)))
 	b.WriteString("\n")
 	b.WriteString(m.keyHints())
 	return b.String()
+}
+
+func (m Model) renderRow(i int, cols Columns) string {
+	down, hasDown := m.downFor(i)
+	return Row(m.views[i], cols, RowState{
+		LossTrend:  m.lossTrend(i),
+		AvgTrend:   m.avgTrend(i),
+		Flash:      m.flash(i),
+		DownFor:    down,
+		HasDownFor: hasDown,
+	})
+}
+
+// scrollNotice says what is off screen in either direction, and how to reach
+// it. Naming the wheel matters: nothing else on screen suggests the table
+// scrolls at all.
+func scrollNotice(above, below int) string {
+	var parts []string
+	if above > 0 {
+		parts = append(parts, fmt.Sprintf("↑ %d above", above))
+	}
+	if below > 0 {
+		parts = append(parts, fmt.Sprintf("↓ %d below", below))
+	}
+	return strings.Join(parts, "  ·  ") + "  ·  scroll with the wheel"
 }
 
 func (m Model) lossTrend(i int) Trend {
@@ -412,13 +643,78 @@ func (m Model) allProbed() bool {
 	return true
 }
 
+// tally counts the hosts in each state.
+type tally struct{ up, down, dns, waiting int }
+
+func (m Model) tally() tally {
+	var t tally
+	for _, v := range m.views {
+		switch v.State {
+		case monitor.StateUp:
+			t.up++
+		case monitor.StateDown:
+			t.down++
+		case monitor.StateUnresolved:
+			t.dns++
+		default:
+			t.waiting++
+		}
+	}
+	return t
+}
+
+// medianLatency is the middle of the current readings across every host that
+// is up. The median rather than the mean, because one satellite link in a
+// table of LAN hosts would drag a mean somewhere no host actually is.
+func (m Model) medianLatency() (time.Duration, bool) {
+	var live []time.Duration
+	for _, v := range m.views {
+		if v.State == monitor.StateUp && v.HasLatency {
+			live = append(live, v.Last)
+		}
+	}
+	if len(live) == 0 {
+		return 0, false
+	}
+	sort.Slice(live, func(i, j int) bool { return live[i] < live[j] })
+	return live[len(live)/2], true
+}
+
 func (m Model) statusLine(matched int) string {
 	parts := []string{fmt.Sprintf("Interval: %s", m.interval)}
+
+	// The roll-up earns its place only with a table too big to count by eye.
+	if len(m.views) > 1 {
+		t := m.tally()
+		counts := []string{fmt.Sprintf("%d up", t.up), fmt.Sprintf("%d down", t.down)}
+		if t.dns > 0 {
+			counts = append(counts, fmt.Sprintf("%d dns", t.dns))
+		}
+		if t.waiting > 0 {
+			counts = append(counts, fmt.Sprintf("%d waiting", t.waiting))
+		}
+		parts = append(parts, strings.Join(counts, " · "))
+		if med, ok := m.medianLatency(); ok {
+			parts = append(parts, "median "+FormatDuration(med, true))
+		}
+	}
+
 	if m.limit > 0 {
 		parts = append(parts, fmt.Sprintf("Count: %d", m.limit))
 	}
 	if m.filter != FilterAll {
 		parts = append(parts, fmt.Sprintf("Filter: %s (%d of %d)", m.filter, matched, len(m.views)))
+	}
+	if m.belling {
+		parts = append(parts, "Bell")
+	}
+	if m.mon != nil && m.mon.Privileged() {
+		// Worth saying: it means the binary is running with elevated rights,
+		// and it explains behaviour that differs from the unprivileged path.
+		parts = append(parts, "raw socket")
+	}
+	if m.paused {
+		parts = append(parts, "Paused (still probing)")
 	}
 	if m.done {
 		parts = append(parts, "Done")
@@ -427,17 +723,84 @@ func (m Model) statusLine(matched int) string {
 }
 
 func (m Model) keyHints() string {
-	key := func(k, label string) string {
-		return styleKeyName.Render(k) + styleFooter.Render(" "+label)
-	}
 	hints := []string{
 		key("a", "all"),
 		key("u", "up"),
 		key("d", "down"),
 		key("+/-", "rate"),
+		key("p", "pause"),
+		key("?", "help"),
 		key("q", "quit"),
 	}
 	legend := styleBetter.Render(glyphBetter) + styleFooter.Render(" better  ") +
 		styleWorse.Render(glyphWorse) + styleFooter.Render(" worse")
 	return strings.Join(hints, styleFooter.Render("  ")) + styleFooter.Render("   ·   ") + legend
+}
+
+func key(k, label string) string {
+	return styleKeyName.Render(k) + styleFooter.Render(" "+label)
+}
+
+// helpBorderCost is what the rounded border and its padding add to each side
+// of the help box, in display cells.
+const helpBorderCost = 6
+
+// helpView replaces the table rather than floating over it. A terminal has no
+// real z-order, and a half-covered table is harder to read than none at all.
+//
+// It degrades in two steps as the terminal narrows: first the frame goes,
+// because the keys are the point and a box spilling off the right edge helps
+// nobody, and then the descriptions are truncated. The key column itself is
+// never touched — a key you cannot read is a key you cannot press.
+func (m Model) helpView() string {
+	rows := [][2]string{
+		{"a / u / d", "show all hosts, only up, or only down"},
+		{"wheel", "scroll the table"},
+		{"↑ ↓ / j k", "scroll a row at a time"},
+		{"PgUp/PgDn", "scroll a page at a time"},
+		{"g / G", "jump to the top or the bottom"},
+		{"+ / -", "probe slower or faster (= and _ work too)"},
+		{"p", "pause the display; probing carries on"},
+		{"b", "ring the bell when a host changes state"},
+		{"?", "show this help"},
+		{"q", "quit (Esc and Ctrl-C also work)"},
+	}
+
+	const gap = 3
+	keyWidth, textWidth := 0, 0
+	for _, r := range rows {
+		if w := lipgloss.Width(r[0]); w > keyWidth {
+			keyWidth = w
+		}
+		if w := lipgloss.Width(r[1]); w > textWidth {
+			textWidth = w
+		}
+	}
+
+	framed := keyWidth+gap+textWidth+helpBorderCost <= m.width
+	avail := m.width
+	if framed {
+		avail -= helpBorderCost
+	}
+	descWidth := avail - keyWidth - gap
+	if descWidth < 1 {
+		descWidth = 1
+	}
+
+	var b strings.Builder
+	b.WriteString(styleHelpTitle.Render(truncate("pingm — keys", avail)))
+	b.WriteString("\n\n")
+	for _, r := range rows {
+		b.WriteString(left(styleKeyName, r[0], keyWidth))
+		b.WriteString(styleFooter.Render(pad(gap) + truncate(r[1], descWidth)))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+	b.WriteString(styleHint.Render(truncate("press any key to go back", avail)))
+
+	body := b.String()
+	if framed {
+		body = styleHelpBox.Render(body)
+	}
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, body)
 }

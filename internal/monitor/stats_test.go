@@ -218,3 +218,165 @@ func TestNewerTimeoutStillWins(t *testing.T) {
 		t.Errorf("State = %v, want StateDown", s.State)
 	}
 }
+
+// --- Jitter ---------------------------------------------------------------
+
+func TestJitterNeedsTwoRepliesBeforeItMeansAnything(t *testing.T) {
+	var s Stats
+	if s.HasJitter() {
+		t.Error("HasJitter() = true before any reply")
+	}
+
+	s.Record(Result{Probe: 1, OK: true, RTT: 10 * time.Millisecond})
+	if s.HasJitter() {
+		t.Error("HasJitter() = true after one reply, which has no spread")
+	}
+	if got := s.Jitter(); got != 0 {
+		t.Errorf("Jitter() = %v after one reply, want 0", got)
+	}
+
+	s.Record(Result{Probe: 2, OK: true, RTT: 12 * time.Millisecond})
+	if !s.HasJitter() {
+		t.Error("HasJitter() = false after two replies")
+	}
+}
+
+func TestJitterIsTheSpreadOfTheReplies(t *testing.T) {
+	var s Stats
+	for i, rtt := range []time.Duration{10, 20, 30} {
+		s.Record(Result{Probe: i + 1, OK: true, RTT: rtt * time.Millisecond})
+	}
+
+	// Population standard deviation of 10/20/30 is sqrt(200/3) ≈ 8.165 ms,
+	// the same figure ping reports as mdev.
+	want := 8165 * time.Microsecond
+	got := s.Jitter()
+	if diff := got - want; diff > 50*time.Microsecond || diff < -50*time.Microsecond {
+		t.Errorf("Jitter() = %v, want about %v", got, want)
+	}
+}
+
+func TestJitterIsZeroForAPerfectlySteadyLink(t *testing.T) {
+	var s Stats
+	for i := 0; i < 5; i++ {
+		s.Record(Result{Probe: i + 1, OK: true, RTT: 7 * time.Millisecond})
+	}
+	// Floating-point rounding must not turn a flat link into a tiny negative
+	// variance and then a NaN.
+	if got := s.Jitter(); got != 0 {
+		t.Errorf("Jitter() = %v for identical replies, want 0", got)
+	}
+}
+
+func TestJitterIgnoresLostProbes(t *testing.T) {
+	var steady, lossy Stats
+	for i := 0; i < 4; i++ {
+		steady.Record(Result{Probe: i + 1, OK: true, RTT: 10 * time.Millisecond})
+	}
+	lossy.Record(Result{Probe: 1, OK: true, RTT: 10 * time.Millisecond})
+	lossy.Record(Result{Probe: 2, OK: false})
+	lossy.Record(Result{Probe: 3, OK: true, RTT: 10 * time.Millisecond})
+	lossy.Record(Result{Probe: 4, OK: true, RTT: 10 * time.Millisecond})
+
+	if lossy.Jitter() != steady.Jitter() {
+		t.Errorf("Jitter() = %v with losses, want %v — a lost probe has no RTT to vary",
+			lossy.Jitter(), steady.Jitter())
+	}
+}
+
+// A slow link must not overflow the squared accumulator. In nanoseconds the
+// square of a 3s round trip is already past what an int64 holds.
+func TestJitterSurvivesVerySlowLinks(t *testing.T) {
+	var s Stats
+	s.Record(Result{Probe: 1, OK: true, RTT: 4 * time.Second})
+	s.Record(Result{Probe: 2, OK: true, RTT: 6 * time.Second})
+
+	got := s.Jitter()
+	if got <= 0 || got > 2*time.Second {
+		t.Errorf("Jitter() = %v for 4s/6s replies, want about 1s", got)
+	}
+}
+
+// --- Recent samples -------------------------------------------------------
+
+func TestRecentStartsEmpty(t *testing.T) {
+	var s Stats
+	if got := s.Recent(); len(got) != 0 {
+		t.Errorf("Recent() = %v before any probe, want empty", got)
+	}
+}
+
+func TestRecentKeepsProbesInOrderOldestFirst(t *testing.T) {
+	var s Stats
+	for i := 1; i <= 3; i++ {
+		s.Record(Result{Probe: i, OK: true, RTT: time.Duration(i) * time.Millisecond})
+	}
+
+	got := s.Recent()
+	if len(got) != 3 {
+		t.Fatalf("Recent() has %d samples, want 3", len(got))
+	}
+	for i, sample := range got {
+		if want := time.Duration(i+1) * time.Millisecond; sample.RTT != want {
+			t.Errorf("sample %d RTT = %v, want %v", i, sample.RTT, want)
+		}
+	}
+}
+
+func TestRecentRemembersLosses(t *testing.T) {
+	var s Stats
+	s.Record(Result{Probe: 1, OK: true, RTT: time.Millisecond})
+	s.Record(Result{Probe: 2, OK: false})
+
+	got := s.Recent()
+	if len(got) != 2 {
+		t.Fatalf("Recent() has %d samples, want 2", len(got))
+	}
+	if got[1].OK {
+		t.Error("a lost probe was remembered as a reply")
+	}
+}
+
+// The ring must drop the oldest rather than growing without bound.
+func TestRecentIsCappedAndKeepsTheNewest(t *testing.T) {
+	var s Stats
+	total := RecentSamples + 7
+	for i := 1; i <= total; i++ {
+		s.Record(Result{Probe: i, OK: true, RTT: time.Duration(i) * time.Millisecond})
+	}
+
+	got := s.Recent()
+	if len(got) != RecentSamples {
+		t.Fatalf("Recent() has %d samples, want %d", len(got), RecentSamples)
+	}
+	if want := time.Duration(total) * time.Millisecond; got[len(got)-1].RTT != want {
+		t.Errorf("newest sample = %v, want %v", got[len(got)-1].RTT, want)
+	}
+	if want := time.Duration(total-RecentSamples+1) * time.Millisecond; got[0].RTT != want {
+		t.Errorf("oldest sample = %v, want %v", got[0].RTT, want)
+	}
+}
+
+func TestRecentReturnsACopy(t *testing.T) {
+	var s Stats
+	s.Record(Result{Probe: 1, OK: true, RTT: time.Millisecond})
+
+	first := s.Recent()
+	first[0].RTT = time.Hour
+
+	if second := s.Recent(); second[0].RTT == time.Hour {
+		t.Error("mutating the returned slice changed the stored samples")
+	}
+}
+
+func TestUnresolvedStateHasAName(t *testing.T) {
+	if got := StateUnresolved.String(); got != "unresolved" {
+		t.Errorf("StateUnresolved.String() = %q, want %q", got, "unresolved")
+	}
+	if StateUnresolved.Reachable() {
+		t.Error("an unresolved host reported itself as reachable")
+	}
+	if !StateUp.Reachable() {
+		t.Error("an up host reported itself as unreachable")
+	}
+}
