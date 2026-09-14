@@ -23,7 +23,14 @@ a all  u up  d down  q quit   ·   ▼ better  ▲ worse
 
 - **Everything at once** — `pingm 10.0.0.0/24` watches a whole subnet in one table
 - **Honest status** — **✔ UP** / **✘ DOWN** always reflect the *latest* probe, not the host's history
-- **Recovery highlight** — a host that comes alive briefly lights up, so you catch it without staring
+- **State-change highlight** — a host lights up green when it comes alive and red when it drops out
+- **Sparklines** — the last 16 probes per host, with losses drawn as gaps rather than bars
+- **Jitter** — the spread of the replies, the same figure `ping` reports as mdev
+- **Outage timer** — a down host shows how long it has been gone, in place of a latency it cannot supply
+- **DNS failures are their own state** — a name that will not resolve says **? DNS**, not **✘ DOWN**
+- **Scrollable** — mouse wheel or keys, so a /24 is not limited to what fits on screen
+- **Responsive columns** — the table fits itself to the terminal rather than wrapping
+- **CSV log** — `-o soak.csv` records every probe for later analysis
 - **Filter by state** — `-f down` shows only what is broken, or press `d` while it runs
 - **Comma-separated hosts** — `pingm 8.8.8.8,1.1.1.1,router.lan`
 - **IP ranges** — `pingm 10.0.0.1-10.0.0.20`
@@ -93,6 +100,7 @@ pingm google.com,10.0.0.1-10.0.0.4,192.168.1.0/30
 | `-c N` | unlimited | Stop after N probes per host |
 | `-f STATE` | `all` | Show only hosts in STATE: `up`/`online`, `down`/`offline`, or `all` |
 | `-t DURATION` | the interval, capped at 2s | How long to wait for a reply |
+| `-o FILE` | — | Also write every probe outcome to FILE as CSV |
 | `-y` | — | Skip the confirmation prompt for large host counts |
 | `-v` | — | Show version |
 | `-h` | — | Show help |
@@ -105,9 +113,16 @@ Durations take a unit: `250ms`, `2s`, `1m`.
 |-----|--------|
 | `a` | Show all hosts |
 | `u` | Show only hosts that are up |
-| `d` | Show only hosts that are down |
+| `d` | Show only hosts that are down (unresolved names included) |
+| wheel | Scroll the table |
+| `↑` `↓` / `j` `k` | Scroll a row at a time |
+| `PgUp` `PgDn` | Scroll a page at a time |
+| `g` / `G` | Jump to the top or the bottom |
 | `+` | Probe slower (`=` works too, so no shift needed) |
 | `-` | Probe faster (`_` works too) |
+| `p` | Pause the display; probing carries on underneath |
+| `b` | Ring the terminal bell when a host changes state |
+| `?` | Show every key |
 | `q` | Quit (`Esc` and `Ctrl-C` also work) |
 
 `+` and `-` step through `100ms · 200ms · 500ms · 1s · 2s · 5s · 10s`, so the
@@ -127,7 +142,13 @@ host that stops answering is still reported promptly at any cadence.
 
 - **✔ UP** — the most recent probe was answered
 - **✘ DOWN** — the most recent probe went unanswered
+- **? DNS** — the name never resolved, so nothing was ever sent
 - **WAIT** — no probe has completed yet
+
+**? DNS** is kept separate from **✘ DOWN** because the fix is different: a typo
+or a stale DNS entry, not an unreachable host. `-f down` still shows them —
+they are certainly not answering — but the table never blames the host for a
+name that was wrong.
 
 Status always reflects the **latest** probe. A host that answered a hundred
 times and has just missed one is down *right now*, and that is the event the
@@ -142,10 +163,25 @@ Only LATENCY, which is a *current* reading, blanks out.
 but dropping packets stands out — usually the most interesting state on the
 table.
 
-### When a host comes alive
+**JITTER** is the standard deviation of the replies — the figure `ping` calls
+mdev. It answers what an average cannot: whether a link is steadily slow or
+wildly uneven, which is what makes a call stutter. It needs two replies before
+it means anything, so it dashes out until then rather than claiming zero.
+
+**RECENT** is the last 16 probes, newest on the right. Bars are scaled to that
+window rather than to the host's lifetime range, so a small recent wobble stays
+visible instead of flattening as the range widens over hours. Unanswered probes
+are drawn as gaps (`·`), never as bars, so loss can never be misread as latency.
+
+**A down host shows how long it has been gone** where its latency would be —
+`↓ 1m35s`. That cell is dead space otherwise, and "how long has this been
+broken" is the next thing anyone asks after "is it broken".
+
+### When a host changes state
 
 A host that starts answering — a recovery, or its very first reply — gets a
-marker down its left edge that fades out over about a second:
+green marker down its left edge that fades out over about a second, and one
+that drops out gets a red one:
 
 ```
   10.0.0.1   ✔ UP       0.41 ms       0.0%      0.32 ms     0.44 ms      0.61 ms
@@ -155,12 +191,17 @@ marker down its left edge that fades out over about a second:
 
 Motion is what catches the eye, so the highlight stays deliberately quiet
 rather than flooding the row with colour. The animation frames only run while
-something is actually fading — an idle table emits nothing at all, exactly as
-before.
+something is actually fading — an idle table emits nothing at all.
 
-Hosts going *down* are not highlighted, on the grounds that a table full of
-flapping hosts would strobe. The `✘ DOWN` status and the rising loss figure
-already mark those, and `-f down` isolates them.
+A host **coming alive** always flashes, first reply included: that is news
+either way. A host **dropping out** flashes only if it was up beforehand. On
+`pingm 10.0.0.0/24` most addresses are dead from the start, and lighting all of
+them red at once would say nothing while drowning out the one that matters.
+
+Press `b` to have the terminal bell ring on a state change too, for when you
+are waiting on a reboot and not watching the screen. The bell keeps the same
+rule and stays silent through the first readings, so starting the tool never
+sets off a fanfare.
 
 **LOSS** and **AVG** carry a trend arrow comparing them with the previous
 refresh: **▼** when the value fell (better), **▲** when it rose (worse). No
@@ -183,6 +224,69 @@ When nothing matches, the table says why — `All 254 hosts are responding.`
 for an empty `-f down`, or `Waiting for the first replies…` until every host
 has been probed at least once.
 
+### Scrolling
+
+The table scrolls with the **mouse wheel**, and with `↑`/`↓`, `j`/`k`,
+`PgUp`/`PgDn` and `g`/`G` for anyone who would rather not reach for it. A
+footer line names what is off screen in each direction:
+
+```
+↑ 12 above  ·  ↓ 30 below  ·  scroll with the wheel
+```
+
+A table that already fits shows no indicator and gives up no row for it.
+
+Mouse tracking is what makes the wheel work, and it takes over the terminal's
+own click-to-select. Most terminals hand selection back if you hold **Shift**
+(**Option** on macOS Terminal and iTerm).
+
+### Pausing
+
+`p` freezes the **display**, not the probing. Probes keep going out and the
+statistics keep accruing underneath, so nothing is lost and un-pausing shows
+the current truth rather than a gap. It is for reading a table that will not
+hold still.
+
+### Responsive columns
+
+The table fits itself to the terminal rather than wrapping. As it narrows,
+columns drop in reverse order of usefulness — **RECENT** first, then
+**JITTER**, then **MIN** and **MAX** — and come back as it widens:
+
+| Terminal | Columns |
+|----------|---------|
+| ~130+ | everything |
+| ~110 | no RECENT |
+| ~95 | no JITTER either |
+| ~70 | HOST, STATUS, LATENCY, LOSS, AVG |
+
+If even the essentials will not fit, the host column is truncated rather than
+a column being dropped — a shortened name is still recognisable, a missing
+STATUS column is simply gone. The trade never runs the other way: a hostname is
+never truncated to make room for an optional column.
+
+## Logging to a file
+
+`-o` appends every probe outcome to a CSV file while the table runs:
+
+```bash
+pingm -o soak.csv -i 5s 10.0.0.0/24
+```
+
+```csv
+timestamp,host,probe,status,rtt_ms
+2026-09-14T20:33:10.803130+01:00,10.0.0.1,1,up,1.204
+2026-09-14T20:33:10.803210+01:00,10.0.0.2,1,down,
+```
+
+One row per probe, not per refresh: raw outcomes can be re-aggregated any way
+later, whereas a sampled average cannot be taken apart again. A lost probe has
+an empty `rtt_ms` rather than a zero, which would otherwise average in as an
+impossibly fast reply.
+
+The file is flushed about once a second, so `tail -f` works while a long soak
+is still running.
+
 ## Privileges
 
 pingm uses an **unprivileged ICMP datagram socket**, so it does not need root:
@@ -196,7 +300,8 @@ pingm uses an **unprivileged ICMP datagram socket**, so it does not need root:
   ```
 
 If a datagram socket is unavailable, pingm falls back to a raw socket, which
-does require root or `CAP_NET_RAW`.
+does require root or `CAP_NET_RAW`. When that happens the footer says
+`raw socket`, so an elevated run is never silent about it.
 
 ## Large sweeps
 

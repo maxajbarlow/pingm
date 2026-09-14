@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -270,5 +271,94 @@ func TestSpeedingUpTakesEffectImmediately(t *testing.T) {
 	m.mu.RUnlock()
 	if total < 3 {
 		t.Errorf("only %d probes sent, want several — the new interval did not take effect", total)
+	}
+}
+
+func TestUnresolvableHostIsReportedAsUnresolvedNotDown(t *testing.T) {
+	m := newTestMonitor(t, []string{"nope.invalid"}, failingResolver(errors.New("no such host")))
+	defer m.Close()
+
+	// Even after the probe loop has written it off as a loss, the view must
+	// keep saying why: the name is wrong, not the host unreachable.
+	m.stats[0].Record(Result{Probe: 1, OK: false})
+
+	if got := m.Snapshot()[0].State; got != StateUnresolved {
+		t.Errorf("State = %v, want StateUnresolved", got)
+	}
+}
+
+func TestResolvableHostIsNeverReportedAsUnresolved(t *testing.T) {
+	m := newTestMonitor(t, []string{"a"}, fixedResolver("127.0.0.1"))
+	defer m.Close()
+
+	m.stats[0].Record(Result{Probe: 1, OK: false})
+	if got := m.Snapshot()[0].State; got != StateDown {
+		t.Errorf("State = %v, want StateDown", got)
+	}
+}
+
+func TestHostsReturnsTheDisplayNamesInOrder(t *testing.T) {
+	m := newTestMonitor(t, []string{"a", "b", "c"}, fixedResolver("127.0.0.1"))
+	defer m.Close()
+
+	got := m.Hosts()
+	if len(got) != 3 || got[0] != "a" || got[1] != "b" || got[2] != "c" {
+		t.Errorf("Hosts() = %v, want [a b c]", got)
+	}
+}
+
+// recordingRecorder captures what the monitor hands it.
+type recordingRecorder struct {
+	mu    sync.Mutex
+	rows  []Result
+	hosts []string
+	err   error
+}
+
+func (r *recordingRecorder) Record(res Result, _ time.Time, host string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rows = append(r.rows, res)
+	r.hosts = append(r.hosts, host)
+	return r.err
+}
+
+func (r *recordingRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.rows)
+}
+
+func TestRecorderSeesEveryProbeWithItsHostName(t *testing.T) {
+	m := newTestMonitor(t, []string{"a", "b"}, fixedResolver("127.0.0.1"))
+	defer m.Close()
+
+	rec := &recordingRecorder{}
+	m.SetRecorder(rec)
+	m.Run(context.Background(), 3)
+
+	// Two hosts, three rounds each: every probe sent yields exactly one row.
+	if got := rec.count(); got != 6 {
+		t.Errorf("recorder saw %d probes, want 6", got)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	for i, host := range rec.hosts {
+		if host != "a" && host != "b" {
+			t.Errorf("row %d recorded host %q, want one of the targets", i, host)
+		}
+	}
+}
+
+// A recorder that cannot write must not take the table down with it.
+func TestFailingRecorderDoesNotStopProbing(t *testing.T) {
+	m := newTestMonitor(t, []string{"a"}, fixedResolver("127.0.0.1"))
+	defer m.Close()
+
+	m.SetRecorder(&recordingRecorder{err: errors.New("disk full")})
+	m.Run(context.Background(), 2)
+
+	if got := m.stats[0].Sent; got != 2 {
+		t.Errorf("Sent = %d after a failing recorder, want 2", got)
 	}
 }
